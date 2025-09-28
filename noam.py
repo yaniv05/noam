@@ -4,6 +4,7 @@ import requests, streamlit as st, boto3
 from typing import List, Tuple, Optional, Dict
 from PIL import Image, ImageOps, ImageFile
 
+# --- Tolérer certains JPEG tronqués ---
 ImageFile.LOAD_TRUNCATED_IMAGES = True
 
 # ===== ENV (Fidealis) =====
@@ -18,7 +19,7 @@ R2_ACCESS_KEY_ID = os.getenv("R2_ACCESS_KEY_ID")
 R2_SECRET_ACCESS_KEY = os.getenv("R2_SECRET_ACCESS_KEY")
 R2_BUCKET = os.getenv("R2_BUCKET")
 R2_REGION = os.getenv("R2_REGION", "auto")
-R2_ENDPOINT = "https://f02b01cf197682b810e6a39fdbcbaad3.r2.cloudflarestorage.com/fidealis-demo"
+R2_ENDPOINT = f"https://{R2_ACCOUNT_ID}.r2.cloudflarestorage.com"
 
 # ===== S3 client (R2) =====
 s3 = boto3.client(
@@ -123,17 +124,13 @@ def create_all_collages(filepaths: List[str], client_name: str, workdir: str, ma
 # ---------- R2 util ----------
 def r2_presign_post_for_prefix(prefix: str, max_mb=2048, expires=3600):
     """
-    IMPORTANT: on NE fige PAS 'Content-Type' ni 'key' ici.
-    On autorise:
-      - starts-with $key = prefix
-      - starts-with $Content-Type = "" (n'importe lequel)
-      - range taille
-    Le champ 'key' sera fourni côté navigateur (clé = prefix + chemin relatif).
+    Pre-signed POST réutilisable pour TOUTE clé commençant par `prefix`.
+    On n'impose pas 'key' ni 'Content-Type' dans Fields → on les ajoute côté navigateur.
     """
     return s3.generate_presigned_post(
         Bucket=R2_BUCKET,
-        Key=prefix + "${filename}",   # valeur placeholder
-        Fields={},                    # <-- vide, on évite d'imposer 'key' / 'Content-Type'
+        Key=prefix + "${filename}",   # placeholder
+        Fields={},                    # pas de 'key' / 'Content-Type' figés
         Conditions=[
             ["starts-with","$key", prefix],
             ["starts-with","$Content-Type",""],
@@ -169,6 +166,85 @@ def group_by_client(keys: List[str], batch_prefix: str) -> Dict[str,List[str]]:
     for v in groups.values(): v.sort()
     return groups
 
+# ---------- DIAGNOSTIC R2 ----------
+def r2_health(server_prefix="diagnostics/"):
+    st.subheader("🔍 Diagnostic R2")
+    st.write("Endpoint:", f"https://{R2_ACCOUNT_ID}.r2.cloudflarestorage.com")
+    st.write("Bucket:", R2_BUCKET)
+    st.write("Region:", R2_REGION or "auto")
+    st.write("Access Key ID (fin):", (R2_ACCESS_KEY_ID or "")[-4:] if R2_ACCESS_KEY_ID else "ABSENT")
+    st.write("Secret (présent ?):", "OK" if R2_SECRET_ACCESS_KEY else "ABSENT")
+
+    try:
+        s3.head_bucket(Bucket=R2_BUCKET)
+        st.success("head_bucket ✅")
+    except Exception as e:
+        st.error(f"head_bucket ❌ : {e}")
+
+    test_key = f"{server_prefix}{uuid.uuid4()}-ping.txt"
+    try:
+        s3.put_object(Bucket=R2_BUCKET, Key=test_key, Body=b"ping")
+        st.success("put_object ✅")
+        obj = s3.get_object(Bucket=R2_BUCKET, Key=test_key)
+        body = obj["Body"].read()
+        st.success(f"get_object ✅ (contenu={body!r})")
+        s3.delete_object(Bucket=R2_BUCKET, Key=test_key)
+        st.success("delete_object ✅")
+    except Exception as e:
+        st.error(f"put/get/delete ❌ : {e}")
+
+    try:
+        test_prefix = f"{server_prefix}{uuid.uuid4()}/"
+        pres = s3.generate_presigned_post(
+            Bucket=R2_BUCKET,
+            Key=test_prefix + "${filename}",
+            Fields={},
+            Conditions=[
+                ["starts-with","$key", test_prefix],
+                ["starts-with","$Content-Type",""],
+                ["content-length-range", 1, 1024 * 1024],
+            ],
+            ExpiresIn=600,
+        )
+        st.info(f"Préfixe de test: `{test_prefix}`")
+        st.components.v1.html(f"""
+<html><body>
+<button id="btn" style="padding:8px 12px;">Tester upload navigateur → R2</button>
+<pre id="out" style="white-space:pre-wrap;border:1px solid #eee;padding:8px;border-radius:6px;max-height:220px;overflow:auto;margin-top:8px;"></pre>
+<script>
+const pres = {json.dumps(pres)};
+const prefix = {json.dumps(test_prefix)};
+const log = m => document.getElementById('out').textContent += m + "\\n";
+async function testUpload() {{
+  const filename = "ping.txt";
+  const key = prefix + filename;
+  const blob = new Blob(["hello-r2"], {{type: "text/plain"}});
+  const form = new FormData();
+  for (const [k,v] of Object.entries(pres.fields)) {{
+    if (k !== 'key' && k !== 'Content-Type') form.append(k, v);
+  }}
+  form.append('key', key);
+  form.append('file', blob);
+  try {{
+    const t0 = performance.now();
+    const res = await fetch(pres.url, {{ method: 'POST', body: form }});
+    const dt = ((performance.now()-t0)/1000).toFixed(2);
+    let text = "";
+    try {{ text = await res.text(); }} catch (e) {{ text = "(body non lisible, CORS)" }}
+    if (res.ok) log("POST ✅ 200 OK en " + dt + "s");
+    else {{ log("POST ❌ HTTP " + res.status + " en " + dt + "s"); log("Body: " + text); }}
+  }} catch (e) {{
+    log("POST ❌ Failed to fetch: " + (e && e.message ? e.message : e));
+    log("=> Probable CORS / mauvaise URL / connectivité.");
+  }}
+}}
+document.getElementById('btn').addEventListener('click', testUpload);
+</script>
+</body></html>
+""", height=320)
+    except Exception as e:
+        st.error(f"Préparation pre-signed POST ❌ : {e}")
+
 # ========== UI ==========
 st.set_page_config(page_title="FIDEALIS — Dossier → R2 → Traitement auto", layout="centered")
 st.title("FIDEALIS — Dossier → R2 (auto) → Collages → Dépôt")
@@ -182,14 +258,22 @@ credits = get_credit(session_id)
 if isinstance(credits, dict):
     st.caption(f"Crédit restant (Produit 4) : {get_quantity_for_product_4(credits)}")
 
+with st.expander("🧪 Diagnostic R2 (si 'Failed to fetch')", expanded=False):
+    r2_health()
+
 with st.expander("Options de traitement"):
     max_dim = st.slider("Dimension max (px) avant collage", 800, 4000, 1600, step=100)
     jpeg_q  = st.slider("Qualité JPEG", 50, 95, 80, step=1)
 
+# --- Lecture des query params (compat large) ---
+try:
+    params = st.query_params  # Streamlit >= 1.30
+except Exception:
+    params = st.experimental_get_query_params()
+
 # --- Mode post-upload (?batch=...) ---
-params = st.query_params
 if "batch" in params:
-    batch_id = params["batch"]
+    batch_id = params["batch"] if isinstance(params["batch"], str) else params["batch"][0]
     batch_prefix = f"uploads/{batch_id}/"
     st.info(f"Traitement en cours pour le batch : {batch_id}")
     keys = list_objects(batch_prefix)
@@ -234,7 +318,7 @@ if "batch" in params:
     st.balloons(); st.success("🎉 Batch terminé.")
     st.stop()
 
-# --- Ecran initial : 1 bouton ---
+# --- Écran initial : 1 bouton ---
 st.markdown("### 1 clic : choisir le dossier et **Soumettre**")
 if st.button("Sélectionner un dossier et Soumettre", type="primary"):
     batch_id = str(uuid.uuid4())
@@ -279,14 +363,11 @@ pick.addEventListener('change', async () => {{
 
   async function uploadOne(it) {{
     const form = new FormData();
-    // IMPORTANT: ne pas copier 'key' ni 'Content-Type' depuis pres.fields
     for (const [k,v] of Object.entries(pres.fields)) {{
       if (k !== 'key' && k !== 'Content-Type') form.append(k, v);
     }}
-    form.append('key', keyFor(it.rel));    // notre clé dynamique (avec sous-dossiers)
-    // ne PAS ajouter de field 'Content-Type' → laisser S3 accepter n'importe lequel (policy starts-with)
-    form.append('file', it.file);
-
+    form.append('key', keyFor(it.rel));              // clé dynamique (avec sous-dossiers)
+    form.append('file', it.file);                    // ne pas ajouter Content-Type → policy l'autorise
     const t0 = performance.now();
     const res = await fetch(pres.url, {{ method:'POST', body: form }});
     const dt = ((performance.now()-t0)/1000).toFixed(2);
