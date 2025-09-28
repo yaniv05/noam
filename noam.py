@@ -18,12 +18,12 @@ GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
 R2_ACCOUNT_ID = os.getenv("R2_ACCOUNT_ID")
 R2_ACCESS_KEY_ID = os.getenv("R2_ACCESS_KEY_ID")
 R2_SECRET_ACCESS_KEY = os.getenv("R2_SECRET_ACCESS_KEY")
-R2_BUCKET = os.getenv("R2_BUCKET")
+R2_BUCKET = os.getenv("R2_BUCKET")  # ex: "fidealis-demo"
 R2_REGION = os.getenv("R2_REGION", "auto")
-R2_ENDPOINT = f"https://{R2_ACCOUNT_ID}.r2.cloudflarestorage.com"
-
+R2_ENDPOINT = f"https://{R2_ACCOUNT_ID}.r2.cloudflarestorage.com"  # endpoint S3 API (sans /bucket)
 
 # ===== S3 client (R2) =====
+# Important: addressing_style=virtual pour que R2 travaille en virtual-hosted style
 s3 = boto3.client(
     "s3",
     region_name=R2_REGION,
@@ -32,7 +32,6 @@ s3 = boto3.client(
     aws_secret_access_key=R2_SECRET_ACCESS_KEY,
     config=botocore.client.Config(s3={"addressing_style": "virtual"})
 )
-
 
 IMG_EXTS = {".jpg",".jpeg",".png",".JPG",".JPEG",".PNG"}
 CLIENT_RE = re.compile(r"^\s*(.+?)\s*-\s*(.+?)\s*$")
@@ -126,7 +125,6 @@ def create_all_collages(filepaths: List[str], client_name: str, workdir: str, ma
     return out
 
 # ---------- R2 util ----------
-# ---------- R2 util ----------
 def r2_presign_post_for_prefix(prefix: str, max_mb=2048, expires=3600):
     """
     Pre-signed POST réutilisable pour TOUTE clé commençant par `prefix`.
@@ -139,15 +137,13 @@ def r2_presign_post_for_prefix(prefix: str, max_mb=2048, expires=3600):
         Conditions=[
             ["starts-with","$key", prefix],
             ["starts-with","$Content-Type",""],
-            ["content-length-range", 1, 1024*1024*1024],
+            ["content-length-range", 1, max_mb * 1024 * 1024],
         ],
-        ExpiresIn=3600,
+        ExpiresIn=expires,
     )
-    
-    # ⚠️ Correction de l’URL
+    # ⚠️ FORCER l’URL pour inclure /<bucket>, sinon POST va à la racine → 501
     post["url"] = f"{R2_ENDPOINT}/{R2_BUCKET}"
     return post
-
 
 def list_objects(prefix: str) -> List[str]:
     keys, token = [], None
@@ -179,7 +175,7 @@ def group_by_client(keys: List[str], batch_prefix: str) -> Dict[str,List[str]]:
 # ---------- DIAGNOSTIC R2 ----------
 def r2_health(server_prefix="diagnostics/"):
     st.subheader("🔍 Diagnostic R2")
-    st.write("Endpoint:", f"https://{R2_ACCOUNT_ID}.r2.cloudflarestorage.com")
+    st.write("Endpoint S3 API:", R2_ENDPOINT)
     st.write("Bucket:", R2_BUCKET)
     st.write("Region:", R2_REGION or "auto")
     st.write("Access Key ID (fin):", (R2_ACCESS_KEY_ID or "")[-4:] if R2_ACCESS_KEY_ID else "ABSENT")
@@ -203,6 +199,7 @@ def r2_health(server_prefix="diagnostics/"):
     except Exception as e:
         st.error(f"put/get/delete ❌ : {e}")
 
+    # Presigned POST de test (⚠️ forcer l’URL avec /bucket)
     try:
         test_prefix = f"{server_prefix}{uuid.uuid4()}/"
         pres = s3.generate_presigned_post(
@@ -216,18 +213,26 @@ def r2_health(server_prefix="diagnostics/"):
             ],
             ExpiresIn=600,
         )
+        pres["url"] = f"{R2_ENDPOINT}/{R2_BUCKET}"   # <<< important
         st.info(f"Préfixe de test: `{test_prefix}`")
+        st.write("Presigned POST URL (diagnostic):", pres["url"])
+
         st.components.v1.html(f"""
 <html><body>
 <button id="btn" style="padding:8px 12px;">Tester upload navigateur → R2</button>
-<pre id="out" style="white-space:pre-wrap;border:1px solid #eee;padding:8px;border-radius:6px;max-height:220px;overflow:auto;margin-top:8px;"></pre>
+<pre id="out" style="white-space:pre-wrap;border:1px solid #eee;padding:8px;max-height:220px;overflow:auto;margin-top:8px;border-radius:6px;"></pre>
 <script>
 const pres = {json.dumps(pres)};
 const prefix = {json.dumps(test_prefix)};
 const log = m => document.getElementById('out').textContent += m + "\\n";
+
+log("pres.url = " + pres.url);
+
 async function testUpload() {{
   const filename = "ping.txt";
   const key = prefix + filename;
+  log("🔑 key = " + key);
+
   const blob = new Blob(["hello-r2"], {{type: "text/plain"}});
   const form = new FormData();
   for (const [k,v] of Object.entries(pres.fields)) {{
@@ -235,14 +240,13 @@ async function testUpload() {{
   }}
   form.append('key', key);
   form.append('file', blob);
+
   try {{
-    const t0 = performance.now();
     const res = await fetch(pres.url, {{ method: 'POST', body: form }});
-    const dt = ((performance.now()-t0)/1000).toFixed(2);
     let text = "";
-    try {{ text = await res.text(); }} catch (e) {{ text = "(body non lisible, CORS)" }}
-    if (res.ok) log("POST ✅ 200 OK en " + dt + "s");
-    else {{ log("POST ❌ HTTP " + res.status + " en " + dt + "s"); log("Body: " + text); }}
+    try {{ text = await res.text(); }} catch (e) {{ text = "(body non lisible)" }}
+    if (res.ok) log("POST ✅ " + res.status);
+    else {{ log("POST ❌ HTTP " + res.status); log("Body: " + text); }}
   }} catch (e) {{
     log("POST ❌ Failed to fetch: " + (e && e.message ? e.message : e));
     log("=> Probable CORS / mauvaise URL / connectivité.");
@@ -251,7 +255,7 @@ async function testUpload() {{
 document.getElementById('btn').addEventListener('click', testUpload);
 </script>
 </body></html>
-""", height=320)
+""", height=300)
     except Exception as e:
         st.error(f"Préparation pre-signed POST ❌ : {e}")
 
@@ -347,6 +351,8 @@ const batchId = {json.dumps(batch_id)};
 const log = (m)=>document.getElementById('log').textContent += m + "\\n";
 const pick = document.getElementById('picker');
 
+log("pres.url = " + pres.url);
+
 document.getElementById('go').addEventListener('click', ()=> pick.click());
 
 function keyFor(rel) {{
@@ -372,29 +378,30 @@ pick.addEventListener('change', async () => {{
   let done=0;
 
   async function uploadOne(it) {{
+    const key = keyFor(it.rel);
     const form = new FormData();
     for (const [k,v] of Object.entries(pres.fields)) {{
       if (k !== 'key' && k !== 'Content-Type') form.append(k, v);
     }}
-    form.append('key', keyFor(it.rel));              // clé dynamique (avec sous-dossiers)
-    form.append('file', it.file);                    // ne pas ajouter Content-Type → policy l'autorise
-    const t0 = performance.now();
-    const res = await fetch(pres.url, {{ method:'POST', body: form }});
-    const dt = ((performance.now()-t0)/1000).toFixed(2);
-    if (!res.ok) throw new Error(`HTTP ${{res.status}}`);
+    form.append('key', key);
+    form.append('file', it.file);
+    try {{
+      const res = await fetch(pres.url, {{ method:'POST', body: form }});
+      if (!res.ok) throw new Error(`HTTP ${{res.status}}`);
+    }} catch(e) {{
+      log("FAIL "+it.rel+" :: " + e.message + " (key=" + key + ")");
+    }}
     if (++done % 10 === 0) log(`... ${{done}}/${{items.length}}`);
   }}
 
   async function worker() {{
     while (queue.length) {{
       const it = queue.shift();
-      try {{ await uploadOne(it); }}
-      catch(e) {{ log("FAIL "+it.rel+" :: "+e.message); }}
+      await uploadOne(it);
     }}
   }}
 
   await Promise.all(Array.from({{length:K}}, worker));
-  // redirige vers le traitement serveur
   window.location.search = "?batch=" + batchId;
 }});
 </script>
