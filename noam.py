@@ -5,7 +5,6 @@ from typing import List, Tuple, Optional, Dict
 from PIL import Image, ImageOps, ImageFile
 import botocore.client
 
-# --- Tolérer certains JPEG tronqués ---
 ImageFile.LOAD_TRUNCATED_IMAGES = True
 
 # ========= ENV (Fidealis) =========
@@ -21,11 +20,11 @@ R2_ACCESS_KEY_ID = os.getenv("R2_ACCESS_KEY_ID")
 R2_SECRET_ACCESS_KEY = os.getenv("R2_SECRET_ACCESS_KEY")
 R2_REGION = os.getenv("R2_REGION", "auto")
 
-# Virtual-hosted style requis côté navigateur:
+# Virtual-hosted style (navigateur) + endpoint SDK (serveur)
 R2_BUCKET_HOST = f"{R2_BUCKET}.{R2_ACCOUNT_ID}.r2.cloudflarestorage.com"
-R2_ENDPOINT = f"https://{R2_ACCOUNT_ID}.r2.cloudflarestorage.com"  # endpoint S3 pour boto3
+R2_ENDPOINT = f"https://{R2_ACCOUNT_ID}.r2.cloudflarestorage.com"
 
-# ========= S3 client (boto3) pour le serveur =========
+# ========= boto3 client =========
 s3 = boto3.client(
     "s3",
     region_name=R2_REGION,
@@ -126,7 +125,7 @@ def create_all_collages(filepaths: List[str], client_name: str, workdir: str, ma
         os.replace(out[0], renamed); out[0] = renamed
     return out
 
-# ---------- R2 utils serveur ----------
+# ---------- R2 (serveur) ----------
 def list_objects(prefix: str) -> List[str]:
     keys, token = [], None
     while True:
@@ -143,21 +142,40 @@ def split_client(folder: str) -> Optional[Tuple[str,str]]:
     m = CLIENT_RE.match(folder)
     return (m.group(1).strip(), m.group(2).strip()) if m else None
 
+def find_client_segment(path_rel: str) -> Optional[str]:
+    """
+    Ex: "Racine/Client A - 18 rue X/img.jpg" -> "Client A - 18 rue X"
+        "Client B - 2 av Y/img.jpg"         -> "Client B - 2 av Y"
+    """
+    parts = path_rel.strip("/").split("/")
+    for seg in parts:
+        if CLIENT_RE.match(seg or ""):
+            return seg
+    return None
+
 def group_by_client(keys: List[str], batch_prefix: str) -> Dict[str,List[str]]:
     groups: Dict[str,List[str]] = {}
+    samples = []
     for k in keys:
-        if not k.startswith(batch_prefix) or k.endswith("/"): continue
-        rel = k[len(batch_prefix):]
-        top = rel.split("/",1)[0]
-        if split_client(top):
-            groups.setdefault(top, []).append(k)
-    for v in groups.values(): v.sort()
+        if not k.startswith(batch_prefix) or k.endswith("/"):
+            continue
+        rel = k[len(batch_prefix):]            # tout ce qui vient après uploads/<batch>/
+        if not samples and rel:
+            samples.append(rel)
+        client_seg = find_client_segment(rel)
+        if client_seg:
+            groups.setdefault(client_seg, []).append(k)
+    for v in groups.values():
+        v.sort()
+    # aide au debug si vide
+    if not groups and samples:
+        st.warning(f"Exemple de chemin relatif (pour debug) : {samples[0]}")
     return groups
 
 # ---------- Diagnostic R2 ----------
 def r2_health():
     st.subheader("🔍 Diagnostic R2")
-    st.write("Bucket host:", R2_BUCKET_HOST)
+    st.write("Bucket host (browser):", R2_BUCKET_HOST)
     st.write("Endpoint (SDK):", R2_ENDPOINT)
     try:
         s3.head_bucket(Bucket=R2_BUCKET)
@@ -165,7 +183,7 @@ def r2_health():
     except Exception as e:
         st.error(f"head_bucket ❌ : {e}")
 
-    # Petit test PUT/GET côté serveur
+    # Test PUT/GET serveur
     try:
         test_key = f"diagnostics/{uuid.uuid4()}-ping.txt"
         s3.put_object(Bucket=R2_BUCKET, Key=test_key, Body=b"ping")
@@ -208,7 +226,7 @@ if "batch" in params:
     batch_prefix = f"uploads/{batch_id}/"
     st.info(f"Traitement en cours pour le batch : {batch_id}")
     keys = list_objects(batch_prefix)
-    st.write(f"{len(keys)} fichiers détectés dans R2.")
+    st.write(f"{len(keys)} fichier(s) détecté(s) dans R2 sous {batch_prefix}")
     groups = group_by_client(keys, batch_prefix)
     if not groups:
         st.error("Aucun dossier client `ClientName - Address` détecté sous ce batch.")
@@ -249,7 +267,7 @@ if "batch" in params:
     st.balloons(); st.success("🎉 Batch terminé.")
     st.stop()
 
-# --- Écran initial : 1 bouton (upload direct navigateur → R2 par PUT signé) ---
+# --- Ecran initial : upload -> R2 (PUT signé) ---
 st.markdown("### 1 clic : choisir le dossier et **Soumettre**")
 if st.button("Sélectionner un dossier et Soumettre", type="primary"):
     if not all([R2_ACCOUNT_ID, R2_BUCKET, R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY]):
@@ -259,7 +277,6 @@ if st.button("Sélectionner un dossier et Soumettre", type="primary"):
     batch_id = str(uuid.uuid4())
     prefix = f"uploads/{batch_id}/"
 
-    # ⚠️ DÉMO SÉCURITÉ 0 : on expose les clés R2 dans la page pour signer côté navigateur
     st.components.v1.html(f"""
 <!doctype html><html>
 <body>
@@ -317,10 +334,9 @@ pick.addEventListener('change', async () => {{
   async function uploadOne(it) {{
     const url = `https://${{BUCKET_HOST}}/${{keyFor(it.rel)}}`;
     const t0 = performance.now();
-    // Requête signée automatiquement (Authorization) par aws4fetch:
     const res = await client.fetch(url, {{
       method: "PUT",
-      body: it.file,                       // pas de Content-Type signé → facultatif
+      body: it.file,
       headers: {{ "Content-Type": it.file.type || "application/octet-stream" }}
     }});
     const dt = ((performance.now()-t0)/1000).toFixed(2);
@@ -337,10 +353,11 @@ pick.addEventListener('change', async () => {{
   }}
 
   await Promise.all(Array.from({{length:K}}, worker));
-
   log(`Terminé — OK=${{ok}}, FAIL=${{ko}}`);
-  // Redirige vers traitement serveur
-  window.location.search = "?batch=" + BATCH_ID;
+
+  // ⚠️ IMPORTANT : redirige la PAGE PARENTE (pas l'iframe)
+  const target = window.top.location.origin + window.top.location.pathname + "?batch=" + BATCH_ID;
+  window.top.location.href = target;
 }});
 </script>
 </body></html>
