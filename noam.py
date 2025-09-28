@@ -126,22 +126,28 @@ def create_all_collages(filepaths: List[str], client_name: str, workdir: str, ma
     return out
 
 # ---------- R2 util ----------
+# ---------- R2 util ----------
 def r2_presign_post_for_prefix(prefix: str, max_mb=2048, expires=3600):
     """
     Pre-signed POST réutilisable pour TOUTE clé commençant par `prefix`.
     On n'impose pas 'key' ni 'Content-Type' dans Fields → on les ajoute côté navigateur.
     """
-    return s3.generate_presigned_post(
+    post = s3.generate_presigned_post(
         Bucket=R2_BUCKET,
         Key=prefix + "${filename}",   # placeholder
         Fields={},                    # pas de 'key' / 'Content-Type' figés
         Conditions=[
-            ["starts-with","$key", prefix],
-            ["starts-with","$Content-Type",""],
-            ["content-length-range", 1, max_mb*1024*1024],
+            ["starts-with", "$key", prefix],
+            ["starts-with", "$Content-Type", ""],
+            ["content-length-range", 1, max_mb * 1024 * 1024],
         ],
         ExpiresIn=expires,
     )
+
+    # ⚠️ Correction ici : boto3 renvoie parfois juste la racine, on force avec le bucket
+    post["url"] = f"{R2_ENDPOINT}/{R2_BUCKET}"
+    return post
+
 
 def list_objects(prefix: str) -> List[str]:
     keys, token = [], None
