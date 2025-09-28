@@ -1,15 +1,15 @@
+# app.py
 import os
 import io
 import re
 import json
 import uuid
 import base64
-import zipfile
 import tempfile
 import requests
 import streamlit as st
 import boto3
-from typing import List, Tuple, Optional
+from typing import List, Tuple, Optional, Dict
 from PIL import Image, ImageOps, ImageFile
 
 # --- Tolérer certains JPEG tronqués ---
@@ -56,9 +56,7 @@ def api_login() -> Optional[str]:
         return None
 
 def api_upload_files(description: str, filepaths: List[str], session_id: str):
-    """
-    Envoie les collages à Fidealis par lots de 12 (depuis le disque local).
-    """
+    """Envoie les collages à Fidealis par lots de 12 (depuis le disque local)."""
     for i in range(0, len(filepaths), 12):
         batch = filepaths[i:i + 12]
         data = {
@@ -163,65 +161,82 @@ def create_all_collages(filepaths: List[str], client_name: str, workdir: str, ma
         collages[0] = renamed
     return collages
 
-# ========= ZIP parsing (ClientName - Address) =========
-def parse_folder_name(name: str) -> Optional[Tuple[str, str]]:
-    m = re.match(r"^\s*(.+?)\s*-\s*(.+?)\s*$", name)
+# ========= Regrouper par "ClientName - Address" via clés R2 =========
+CLIENT_FOLDER_RE = re.compile(r"^\s*(.+?)\s*-\s*(.+?)\s*$")
+
+def split_client_address(foldername: str) -> Optional[Tuple[str, str]]:
+    m = CLIENT_FOLDER_RE.match(foldername)
     if not m:
         return None
     return m.group(1).strip(), m.group(2).strip()
 
-def dir_contains_images(path: str) -> bool:
-    for _, _, files in os.walk(path):
-        for fn in files:
-            if os.path.splitext(fn)[1] in IMG_EXTS:
-                return True
-    return False
+def list_objects(prefix: str) -> List[str]:
+    """Liste toutes les clés sous un préfixe R2/S3."""
+    keys: List[str] = []
+    token = None
+    while True:
+        kw = {"Bucket": R2_BUCKET, "Prefix": prefix, "MaxKeys": 1000}
+        if token:
+            kw["ContinuationToken"] = token
+        resp = s3.list_objects_v2(**kw)
+        for obj in resp.get("Contents", []):
+            keys.append(obj["Key"])
+        if resp.get("IsTruncated"):
+            token = resp.get("NextContinuationToken")
+        else:
+            break
+    return keys
 
-def find_client_dirs(extract_root: str) -> List[str]:
-    entries = [e for e in os.listdir(extract_root) if e not in {"__MACOSX", ".DS_Store"}]
-    fulls   = [os.path.join(extract_root, e) for e in entries]
-    only_dirs = [p for p in fulls if os.path.isdir(p)]
-    has_images_top = any(
-        os.path.splitext(e)[1] in IMG_EXTS and os.path.isfile(os.path.join(extract_root, e))
-        for e in entries
-    )
-    base = extract_root
-    if len(only_dirs) == 1 and not has_images_top:
-        base = only_dirs[0]
-    client_dirs = []
-    for e in os.listdir(base):
-        p = os.path.join(base, e)
-        if os.path.isdir(p) and e not in {"__MACOSX", ".DS_Store"}:
-            if parse_folder_name(e) and dir_contains_images(p):
-                client_dirs.append(p)
-    return client_dirs
-
-def list_images_under(path: str) -> List[str]:
-    files: List[str] = []
-    for root, _, fnames in os.walk(path):
-        for fn in sorted(fnames):
-            if os.path.splitext(fn)[1] in IMG_EXTS:
-                files.append(os.path.join(root, fn))
-    return files
-
-# ========= R2 Presign (POST) =========
-def r2_presign_post(key: str, content_type: str, max_mb=1024, expires=3600):
+def group_keys_by_client(keys: List[str], batch_prefix: str) -> Dict[str, List[str]]:
     """
-    Génère un pre-signed POST pour envoyer un fichier depuis le navigateur vers R2.
+    Regroupe les clés par dossier client = 1er segment après batch_prefix.
+    On s'attend à batch_prefix + "<ClientName - Address>/**"
     """
+    groups: Dict[str, List[str]] = {}
+    for k in keys:
+        if not k.startswith(batch_prefix):
+            continue
+        # extrait le chemin relatif après prefix
+        rel = k[len(batch_prefix):]
+        # rel = "<ClientName - Address>/.../file.jpg"
+        parts = rel.split("/", 1)
+        if len(parts) < 2:
+            continue
+        top = parts[0]  # dossier client
+        if split_client_address(top):
+            groups.setdefault(top, []).append(k)
+    # trier les listes pour un ordre stable
+    for v in groups.values():
+        v.sort()
+    return groups
+
+# ========= Pre-signed POST (starts-with) =========
+def r2_presign_post_for_prefix(prefix: str, max_mb=1024, expires=3600):
+    """
+    Génère un pre-signed POST **réutilisable** pour tout objet dont la clé commence par `prefix`.
+    NB: pas de champ 'key' figé; on met une Condition 'starts-with' sur $key.
+    Le navigateur devra inclure un champ `key` pour CHAQUE fichier.
+    """
+    # boto3 ne propose pas directement 'starts-with' sur $key via arguments high-level;
+    # mais on peut "tricher" en passant Fields minimal + Conditions custom.
+    # On utilise une petite astuce: on génère d'abord un POST avec une key bidon puis on remplace la policy.
+    # → plus simple: on appelle generate_presigned_post sans 'Key', et on fournit Conditions.
     return s3.generate_presigned_post(
         Bucket=R2_BUCKET,
-        Key=key,
-        Fields={"Content-Type": content_type},
+        Key=prefix + "${filename}",  # champ 'Key' par défaut (sera écrasé par notre field 'key')
+        Fields={
+            "Content-Type": "application/octet-stream",
+        },
         Conditions=[
-            {"Content-Type": content_type},
+            ["starts-with", "$key", prefix],
+            ["starts-with", "$Content-Type", ""],
             ["content-length-range", 1, max_mb * 1024 * 1024],
         ],
         ExpiresIn=expires,
     )
 
 # ========= UI =========
-st.title("FIDEALIS — Démo upload direct R2 (ZIP) → traitement multi-clients")
+st.title("FIDEALIS — Démo dossier → R2 (uploads parallèles) → traitement multi-clients")
 
 # Connexion Fidealis
 session_id = api_login()
@@ -233,115 +248,150 @@ credits = get_credit(session_id)
 if isinstance(credits, dict):
     st.info(f"Crédit restant (Produit 4) : {get_quantity_for_product_4(credits)}")
 
-with st.expander("Options"):
+with st.expander("Options de traitement"):
     max_dim = st.slider("Dimension max (px) avant collage", 800, 4000, 1600, step=100)
     jpeg_quality = st.slider("Qualité JPEG", 50, 95, 80, step=1)
 
-# 1) Générer un pre-signed pour un ZIP à uploader direct → R2
-zip_local = st.file_uploader("Sélectionne un ZIP (démo : upload direct vers R2)", type=["zip"])
-if st.button("Uploader ce ZIP directement vers R2") and zip_local:
-    # On ne passe pas le binaire du ZIP dans Streamlit → on redemande le fichier côté navigateur (sécurité 0 DEMO)
-    # On fabrique une clé unique dans R2
-    key = f"uploads/demo/{uuid.uuid4()}_{zip_local.name}"
-    pres = r2_presign_post(key, "application/zip", max_mb=2048, expires=3600)  # jusqu'à 2 Go démo
+# 1) Prépare un batch et une politique POST "starts-with"
+if st.button("1) Créer un batch & obtenir l'URL d'upload"):
+    batch_id = str(uuid.uuid4())
+    prefix = f"uploads/{batch_id}/"
+    post = r2_presign_post_for_prefix(prefix, max_mb=2048, expires=3600)  # 2 Go/fichier démo
+    st.session_state["batch_prefix"] = prefix
+    st.session_state["post"] = post
+    st.success(f"Batch créé. Préfixe R2: {prefix}")
 
-    st.session_state["last_zip_key"] = key
-    st.write("Clé R2:", key)
-
+    # Formulaire HTML : input dossier + upload parallèle (sécurité 0, démo)
     st.components.v1.html(f"""
-<html><body>
-<h4>Uploader le même ZIP vers R2</h4>
-<input id="zipfile" type="file" accept=".zip" />
-<pre id="log" style="white-space:pre-wrap;border:1px solid #eee;padding:8px;border-radius:6px;"></pre>
+<!doctype html><html><body>
+<h4>Sélectionne un dossier (avec sous-dossiers par client)</h4>
+<input id="picker" type="file" webkitdirectory directory multiple />
+<br/><br/>
+<label>Parallèle max:</label> <input id="k" type="number" value="8" min="1" max="16" />
+<button id="go">Uploader vers R2</button>
+<pre id="log" style="white-space:pre-wrap;border:1px solid #eee;padding:8px;border-radius:6px;max-height:300px;overflow:auto"></pre>
 <script>
-const pres = {json.dumps(pres)};
+const pres = {json.dumps(post)};
+const prefix = {json.dumps(prefix)};
 const log = (m) => document.getElementById('log').textContent += m + "\\n";
-document.getElementById('zipfile').addEventListener('change', async (ev) => {{
-  const f = ev.target.files[0];
-  if (!f) return;
+
+async function uploadOne(file, relPath) {{
+  // Clé S3 = prefix + chemin relatif (on normalise les séparateurs et supprime ./)
+  const key = prefix + relPath.replace(/^\\.\\//,'').replaceAll('\\\\','/');
+
   const form = new FormData();
+  // champs signés
   Object.entries(pres.fields).forEach(([k,v]) => form.append(k,v));
-  form.append('Content-Type', 'application/zip');
-  form.append('file', f);
+  // notre 'key' réel (autorisé par starts-with)
+  form.append('key', key);
+  // type
+  form.append('Content-Type', file.type || 'application/octet-stream');
+  // fichier
+  form.append('file', file);
+
   const t0 = performance.now();
-  const res = await fetch(pres.url, {{ method:'POST', body: form }});
+  const res = await fetch(pres.url, {{ method: 'POST', body: form }});
   const dt = ((performance.now()-t0)/1000).toFixed(2);
-  log(res.ok ? "OK upload en "+dt+"s" : "FAIL "+res.status+" en "+dt+"s");
+  if (!res.ok) throw new Error("HTTP " + res.status + " pour " + relPath + " ("+dt+"s)");
+  return {{ key, sec: dt }};
+}}
+
+document.getElementById('go').addEventListener('click', async () => {{
+  const inp = document.getElementById('picker');
+  const files = Array.from(inp.files || []);
+  if (!files.length) {{ log("Aucun fichier sélectionné."); return; }}
+  const k = Math.max(1, Math.min(16, parseInt(document.getElementById('k').value || '8')));
+  log("Fichiers: " + files.length + " | parallèle=" + k);
+
+  // Construire le chemin relatif (webkitRelativePath dispo sur chrome/edge)
+  const items = files.map(f => {{
+    const rel = f.webkitRelativePath && f.webkitRelativePath.length ? f.webkitRelativePath : f.name;
+    return {{ file: f, rel: rel }};
+  }});
+
+  // Uploader avec file queue + k parallèles
+  let done = 0;
+  const queue = items.slice();
+  const worker = async () => {{
+    while (queue.length) {{
+      const it = queue.shift();
+      try {{
+        const r = await uploadOne(it.file, it.rel);
+        done++;
+        log("OK " + it.rel + " → " + r.key + " ("+ r.sec +"s) [" + done + "/" + items.length + "]");
+      }} catch (e) {{
+        log("FAIL " + it.rel + " :: " + e.message);
+      }}
+    }}
+  }};
+  await Promise.all(Array.from({{length:k}}, worker));
+  log("Terminé. Reviens dans l'app et clique '2) Traiter ce batch'.");
 }});
 </script>
 </body></html>
-""", height=260)
-    st.info("Après l'upload, clique sur “Traiter le ZIP depuis R2” ci-dessous.")
+""", height=420)
+    st.info("Après l’upload navigateur → R2, passe à l’étape 2.")
 
-# 2) Traiter le ZIP depuis R2 (pipeline complet)
-if st.button("Traiter le ZIP depuis R2") and st.session_state.get("last_zip_key"):
-    zip_key = st.session_state["last_zip_key"]
-    with tempfile.TemporaryDirectory(dir="/tmp") as tmpdir:
-        # Télécharger le ZIP depuis R2 → fichier local
-        zip_path = os.path.join(tmpdir, "batch.zip")
-        with open(zip_path, "wb") as f:
-            s3.download_fileobj(R2_BUCKET, zip_key, f)
+# 2) Lister sous le préfixe et traiter (collages + Fidealis)
+if st.button("2) Traiter ce batch") and "batch_prefix" in st.session_state:
+    prefix = st.session_state["batch_prefix"]
+    st.write(f"Préfixe: `{prefix}`")
+    keys = list_objects(prefix)
+    st.write(f"Trouvé {len(keys)} fichier(s) sur R2.")
 
-        # Extraire
-        with zipfile.ZipFile(zip_path, "r") as z:
-            z.extractall(tmpdir)
+    # Regrouper par dossier client (top-level après prefix)
+    groups = group_keys_by_client(keys, prefix)
+    if not groups:
+        st.error("Aucun dossier client `ClientName - Address` détecté sous ce batch.")
+        st.stop()
 
-        # Détecter dossiers clients
-        client_dirs = find_client_dirs(tmpdir)
-        if not client_dirs:
-            st.error("Aucun sous-dossier client `ClientName - Address` trouvé dans le ZIP.")
-            st.stop()
+    st.write(f"👥 {len(groups)} client(s) détecté(s).")
+    p_clients = st.progress(0.0)
 
-        st.write(f"📁 {len(client_dirs)} client(s) détecté(s).")
-        p_clients = st.progress(0.0)
+    for idx, (client_folder, client_keys) in enumerate(groups.items(), start=1):
+        parsed = split_client_address(client_folder)
+        if not parsed:
+            st.warning(f"Ignoré (nom invalide): {client_folder}")
+            p_clients.progress(idx / len(groups))
+            continue
 
-        for idx, cdir in enumerate(client_dirs, start=1):
-            folder = os.path.basename(cdir)
-            parsed = parse_folder_name(folder)
-            if not parsed:
-                st.warning(f"Ignoré (nom invalide) : {folder}")
-                p_clients.progress(idx / len(client_dirs))
-                continue
+        client_name, address = parsed
+        lat, lng = get_coordinates(address)
+        if lat is None or lng is None:
+            lat, lng = ("N/A", "N/A")
+            st.warning(f"⚠️ Géocodage indisponible pour: {client_folder}")
 
-            client_name, address = parsed
-            lat, lng = get_coordinates(address)
-            if lat is None or lng is None:
-                lat, lng = ("N/A", "N/A")
-                st.warning(f"⚠️ Géocodage indisponible pour: {folder}")
+        st.info(f"👤 {client_name} — {len(client_keys)} fichier(s)")
 
-            # Lister images du dossier
-            raw_files = list_images_under(cdir)
-            if not raw_files:
-                st.warning(f"Aucune image dans: {folder}")
-                p_clients.progress(idx / len(client_dirs))
-                continue
+        # Télécharger localement chaque image du client vers /tmp
+        normalized_paths: List[str] = []
+        p_imgs = st.progress(0.0)
+        with tempfile.TemporaryDirectory(dir="/tmp") as tmpdir:
+            for j, key in enumerate(client_keys, start=1):
+                # skip dossiers "virtuels" (clé finissant par '/')
+                if key.endswith("/"):
+                    p_imgs.progress(j / len(client_keys))
+                    continue
+                # charge l'objet en mémoire
+                buf = io.BytesIO()
+                s3.download_fileobj(R2_BUCKET, key, buf)
+                jb = preprocess_to_jpeg_bytes(buf.getvalue(), max_dim=max_dim, quality=jpeg_quality)
+                outp = os.path.join(tmpdir, f"{client_name}_{j:05d}.jpg")
+                with open(outp, "wb") as o:
+                    o.write(jb)
+                normalized_paths.append(outp)
+                p_imgs.progress(j / len(client_keys))
 
-            st.info(f"👤 {client_name} — {len(raw_files)} image(s)")
-            # Normaliser en JPEG vers /tmp (noms client_index)
-            normalized: List[str] = []
-            p_imgs = st.progress(0.0)
-            for j, fp in enumerate(raw_files, start=1):
-                try:
-                    with open(fp, "rb") as f:
-                        jb = preprocess_to_jpeg_bytes(f.read(), max_dim=max_dim, quality=jpeg_quality)
-                    outp = os.path.join(tmpdir, f"{client_name}_{j:05d}.jpg")
-                    with open(outp, "wb") as o:
-                        o.write(jb)
-                    normalized.append(outp)
-                except Exception as e:
-                    st.error(f"Erreur normalisation {os.path.basename(fp)} : {e}")
-                p_imgs.progress(j / len(raw_files))
-
-            if not normalized:
-                st.error(f"Échec normalisation pour: {client_name}")
-                p_clients.progress(idx / len(client_dirs))
+            if not normalized_paths:
+                st.error(f"Aucune image exploitable pour: {client_name}")
+                p_clients.progress(idx / len(groups))
                 continue
 
             # Collages par 3 + renommage du 1er
-            collages = create_all_collages(normalized, client_name, tmpdir, max_dim=max_dim, quality=jpeg_quality)
+            collages = create_all_collages(normalized_paths, client_name, tmpdir, max_dim=max_dim, quality=jpeg_quality)
             if not collages:
-                st.error(f"Échec collages pour: {client_name}")
-                p_clients.progress(idx / len(client_dirs))
+                st.error(f"Échec collages: {client_name}")
+                p_clients.progress(idx / len(groups))
                 continue
 
             description = (
@@ -349,14 +399,11 @@ if st.button("Traiter le ZIP depuis R2") and st.session_state.get("last_zip_key"
                 f"Adresse: {address}, Coordonnées GPS: Latitude {lat}, Longitude {lng}"
             )
 
-            # Envoi Fidealis par lots de 12 (comme avant)
+            # Envoi Fidealis par 12
             api_upload_files(description, collages, session_id)
 
-            st.success(f"✅ {client_name} — {len(collages)} collage(s) envoyé(s).")
-            p_clients.progress(idx / len(client_dirs))
+        st.success(f"✅ {client_name} — {len(collages)} collage(s) envoyé(s).")
+        p_clients.progress(idx / len(groups))
 
-        st.balloons()
-        st.success("🎉 Traitement terminé.")
-
-else:
-    st.caption("1) Upload ZIP → R2, 2) Traiter depuis R2.")
+    st.balloons()
+    st.success("🎉 Batch terminé.")
