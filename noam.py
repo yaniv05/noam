@@ -39,6 +39,7 @@ s3 = boto3.client(
 IMG_EXTS = {".jpg",".jpeg",".png",".JPG",".JPEG",".PNG"}
 CLIENT_RE = re.compile(r"^\s*(.+?)\s*-\s*(.+?)\s*$")  # "ClientName - Address"
 
+# ----------------- util -----------------
 def now_str() -> str:
     return datetime.now().strftime("%H:%M:%S")
 
@@ -186,7 +187,7 @@ def group_keys_by_client(keys: List[str], batch_prefix: str) -> Dict[str, List[s
     return groups
 
 # =========================================
-#     RUNTIME PARTAGÉ (PAS session_state)
+#        RUNTIME PARTAGÉ (thread-safe)
 # =========================================
 LOCK = threading.Lock()
 
@@ -208,7 +209,7 @@ def make_runtime():
         # clients[client_folder] = {
         #   name,address,lat,lng, seen_keys:set, normalized_count:int,
         #   buffer_paths:[], files_sent:int, collages_sent:int, api_calls:int,
-        #   status:str, last_event:str
+        #   status:str, last_event:str, r2_seen_count:int
         # }
         "clients": {},
         "logs": []
@@ -217,8 +218,8 @@ def make_runtime():
 def rt_log(rt, msg: str):
     with LOCK:
         rt["logs"].append(msg)
-        if len(rt["logs"]) > 1000:
-            rt["logs"] = rt["logs"][-1000:]
+        if len(rt["logs"]) > 1200:
+            rt["logs"] = rt["logs"][-1200:]
 
 def rt_ensure_client(rt, client_folder, name, address):
     with LOCK:
@@ -237,6 +238,7 @@ def rt_ensure_client(rt, client_folder, name, address):
             "api_calls": 0,
             "status": "en attente",
             "last_event": now_str(),
+            "r2_seen_count": 0
         }
 
 def client_root_dir(root_tmp: str, client_folder: str) -> str:
@@ -267,79 +269,92 @@ def processor_thread(rt: dict, fidealis_session: str):
             groups = group_keys_by_client(keys, batch_prefix)
             updated = False
 
+            # Enregistrer le nombre d'objets du côté R2 (upload détecté)
             for client_folder, client_keys in groups.items():
                 parsed = split_client(client_folder)
                 if not parsed:
                     continue
                 client_name, address = parsed
                 rt_ensure_client(rt, client_folder, client_name, address)
-
                 with LOCK:
                     c = rt["clients"][client_folder]
+                    c["r2_seen_count"] = len(client_keys)
                     c["status"] = "traitement"
                     c["last_event"] = now_str()
 
-                # nouvelles clés
+            # Normaliser et pousser par blocs de 36
+            for client_folder, client_keys in groups.items():
+                parsed = split_client(client_folder)
+                if not parsed:
+                    continue
+                client_name, address = parsed
+
                 with LOCK:
+                    c = rt["clients"][client_folder]
                     seen = set(c["seen_keys"])
                 new_keys = [k for k in client_keys if k not in seen]
+                if not new_keys:
+                    continue
 
-                if new_keys:
-                    updated = True
-                    cdir = client_root_dir(root_tmp, client_folder)
-                    os.makedirs(cdir, exist_ok=True)
-                    for key in new_keys:
-                        try:
-                            b = io.BytesIO()
-                            s3.download_fileobj(R2_BUCKET, key, b)
-                            jb = preprocess_to_jpeg_bytes(b.getvalue(), max_dim=max_dim, quality=jpeg_q)
-                            outp = safe_join(cdir, f"{uuid.uuid4().hex}.jpg")
-                            with open(outp, "wb") as o: o.write(jb)
-                            with LOCK:
-                                rt["clients"][client_folder]["buffer_paths"].append(outp)
-                                rt["clients"][client_folder]["normalized_count"] += 1
-                                rt["clients"][client_folder]["seen_keys"].add(key)
-                        except Exception as e:
-                            rt_log(rt, f"{now_str()}  Normalisation échec {key}: {e}")
+                updated = True
+                cdir = client_root_dir(root_tmp, client_folder)
+                os.makedirs(cdir, exist_ok=True)
 
-                    # blocs de 36
-                    while True:
+                # Normalisation
+                for key in new_keys:
+                    try:
+                        b = io.BytesIO()
+                        s3.download_fileobj(R2_BUCKET, key, b)
+                        jb = preprocess_to_jpeg_bytes(b.getvalue(), max_dim=max_dim, quality=jpeg_q)
+                        outp = safe_join(cdir, f"{uuid.uuid4().hex}.jpg")
+                        with open(outp, "wb") as o: o.write(jb)
                         with LOCK:
-                            buf = rt["clients"][client_folder]["buffer_paths"]
-                            if len(buf) < 36:
-                                break
-                            block = buf[:36]
-                            del buf[:36]
-                            name = rt["clients"][client_folder]["name"]
-                            addr = rt["clients"][client_folder]["address"]
-                            lat = rt["clients"][client_folder]["lat"]
-                            lng = rt["clients"][client_folder]["lng"]
+                            c_ref = rt["clients"][client_folder]
+                            c_ref["buffer_paths"].append(outp)
+                            c_ref["normalized_count"] += 1
+                            c_ref["seen_keys"].add(key)
+                    except Exception as e:
+                        rt_log(rt, f"{now_str()}  Normalisation échec {key}: {e}")
 
-                        tmp_send = safe_join(root_tmp, f"send_{uuid.uuid4().hex}", "")
-                        os.makedirs(tmp_send, exist_ok=True)
-                        collages = create_collages_from_paths(block, name, tmp_send, q=jpeg_q)
-                        description = (f"SCELLÉ NUMERIQUE Bénéficiaire: Nom: {name}, "
-                                       f"Adresse: {addr}, Coordonnées GPS: Latitude {lat}, Longitude {lng}")
-                        api_upload_files(description, collages, fidealis_session, lambda m: rt_log(rt, m))
-                        with LOCK:
-                            rt["clients"][client_folder]["files_sent"] += len(block)
-                            rt["clients"][client_folder]["collages_sent"] += len(collages)
-                            rt["clients"][client_folder]["api_calls"] += max(1, (len(collages)+11)//12)
-                        try:
-                            shutil.rmtree(tmp_send, ignore_errors=True)
-                        except Exception:
-                            pass
-                        rt_log(rt, f"{now_str()}  {name}: bloc de 36 envoyé")
+                # Blocs de 36
+                while True:
+                    with LOCK:
+                        buf = rt["clients"][client_folder]["buffer_paths"]
+                        if len(buf) < 36:
+                            break
+                        block = buf[:36]
+                        del buf[:36]
+                        name = rt["clients"][client_folder]["name"]
+                        addr = rt["clients"][client_folder]["address"]
+                        lat = rt["clients"][client_folder]["lat"]
+                        lng = rt["clients"][client_folder]["lng"]
+
+                    tmp_send = safe_join(root_tmp, f"send_{uuid.uuid4().hex}", "")
+                    os.makedirs(tmp_send, exist_ok=True)
+                    collages = create_collages_from_paths(block, name, tmp_send, q=jpeg_q)
+                    description = (f"SCELLÉ NUMERIQUE Bénéficiaire: Nom: {name}, "
+                                   f"Adresse: {addr}, Coordonnées GPS: Latitude {lat}, Longitude {lng}")
+                    api_upload_files(description, collages, fidealis_session, lambda m: rt_log(rt, m))
+                    with LOCK:
+                        rt["clients"][client_folder]["files_sent"] += len(block)
+                        rt["clients"][client_folder]["collages_sent"] += len(collages)
+                        rt["clients"][client_folder]["api_calls"] += max(1, (len(collages)+11)//12)
+                        rt["clients"][client_folder]["last_event"] = now_str()
+                    try:
+                        shutil.rmtree(tmp_send, ignore_errors=True)
+                    except Exception:
+                        pass
+                    rt_log(rt, f"{now_str()}  {name}: bloc de 36 images envoyé à Fidealis")
 
             if updated:
                 with LOCK:
                     runner["last_activity"] = time.time()
 
-            # fin si inactif
+            # Fin si inactif
             with LOCK:
                 inactive = (time.time() - runner["last_activity"]) > inactivity_s
             if inactive:
-                rt_log(rt, f"{now_str()}  Inactivité {int(inactivity_s)}s: finalisation reliquats")
+                rt_log(rt, f"{now_str()}  Inactivité {int(inactivity_s)}s: finalisation des reliquats (<36)")
                 for client_folder, c in list(rt["clients"].items()):
                     with LOCK:
                         buf = list(c["buffer_paths"])
@@ -359,7 +374,8 @@ def processor_thread(rt: dict, fidealis_session: str):
                     with LOCK:
                         rt["clients"][client_folder]["files_sent"] += len(buf)
                         rt["clients"][client_folder]["collages_sent"] += len(collages)
-                        rt["clients"][client_folder]["api_calls"] += max(1, (len(collages)+11)//12) if collages else 0
+                        if collages:
+                            rt["clients"][client_folder]["api_calls"] += max(1, (len(collages)+11)//12)
                         rt["clients"][client_folder]["status"] = "terminé"
                         rt["clients"][client_folder]["last_event"] = now_str()
                     try:
@@ -388,10 +404,9 @@ def processor_thread(rt: dict, fidealis_session: str):
 st.set_page_config(page_title="FIDEALIS — Dossier → R2 → Traitement automatique", layout="wide")
 st.title("FIDEALIS — Dossier → R2 → Collages → Dépôt (automatique)")
 
-# runtime dans session_state (mais le thread n'y touche jamais)
+# runtime dans session_state (le thread n’y touche jamais)
 if "runtime" not in st.session_state:
     st.session_state.runtime = make_runtime()
-
 rt = st.session_state.runtime  # alias
 
 # Connexion Fidealis
@@ -405,6 +420,14 @@ credits = get_credit(session_id)
 if isinstance(credits, dict):
     st.caption(f"Crédit restant (Produit 4) : {get_quantity_for_product_4(credits)}")
 
+# Diagnostic simple
+with st.expander("Diagnostic R2 (serveur)"):
+    try:
+        s3.head_bucket(Bucket=R2_BUCKET)
+        st.success("head_bucket OK")
+    except Exception as e:
+        st.error(f"head_bucket: {e}")
+
 # Options
 with st.expander("Options de traitement"):
     with LOCK:
@@ -413,12 +436,12 @@ with st.expander("Options de traitement"):
         rt["runner"]["inactivity_s"] = st.slider("Arrêt auto si plus de nouvelles images (s)", 10, 300, int(rt["runner"]["inactivity_s"]), step=5)
         rt["runner"]["poll_s"] = st.slider("Intervalle de polling R2 (s)", 0.5, 5.0, float(rt["runner"]["poll_s"]), step=0.5)
 
-# Démarrage global
+# Déclenchement global
 colA, colB = st.columns([1,2])
 with colA:
-    start_clicked = st.button("Choisir le dossier et tout lancer", type="primary")
+    start_clicked = st.button("Choisir un dossier et tout lancer", type="primary")
 with colB:
-    st.write("Après sélection, l’upload vers R2 démarre et le traitement s’exécute en parallèle. Le suivi s’actualise automatiquement.")
+    st.write("Après la sélection, l’upload vers R2 démarre et le traitement s’exécute en parallèle. Le suivi s’actualise automatiquement.")
 
 if start_clicked:
     if not all([R2_ACCOUNT_ID, R2_BUCKET, R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY]):
@@ -433,15 +456,15 @@ if start_clicked:
         rt["runner"]["root_tmp"] = os.path.join("/tmp", f"batch_{rt['runner']['batch_id']}")
         os.makedirs(rt["runner"]["root_tmp"], exist_ok=True)
 
-    # panneau upload (iframe) + démarrage thread
     prefix = f"uploads/{rt['runner']['batch_id']}/"
-    st.subheader("Upload vers R2 (client)")
+    st.subheader("Upload vers R2 (navigateur) — progression locale")
+    # IMPORTANT: pas de '$' avant {{...}} ; encodeURIComponent côté JS
     st.components.v1.html(f"""
 <!doctype html><html>
 <body>
 <input id="picker" type="file" webkitdirectory directory multiple style="display:none" />
 <button id="go" style="padding:10px 16px;">Choisir le dossier…</button>
-<pre id="log" style="white-space:pre-wrap;border:1px solid #ccc;padding:8px;border-radius:6px;max-height:280px;overflow:auto;margin-top:10px;"></pre>
+<pre id="log" style="white-space:pre-wrap;border:1px solid #ccc;padding:8px;border-radius:6px;max-height:300px;overflow:auto;margin-top:10px;"></pre>
 
 <script type="module">
 import {{ AwsClient }} from "https://esm.sh/aws4fetch@1.0.17";
@@ -490,7 +513,8 @@ pick.addEventListener('change', async () => {{
   let ok=0, ko=0, tStart=performance.now();
 
   async function uploadOne(it) {{
-    const url = `https://{R2_BUCKET_HOST}/$${{keyFor(it.rel)}}`;
+    const key = keyFor(it.rel);
+    const url = `https://{R2_BUCKET_HOST}/` + encodeURI(key);
     try {{
       const res = await client.fetch(url, {{
         method: "PUT",
@@ -501,7 +525,7 @@ pick.addEventListener('change', async () => {{
       ok++;
       if ((ok+ko) % 10 === 0) {{
         const pct = Math.round(((ok+ko)/items.length)*100);
-        log(`Progression upload: ${{ok+ko}}/${{items.length}} (${{pct}}%)`);
+        log(`Upload: ${{ok+ko}}/${{items.length}} ({{pct}}%)`);
       }}
     }} catch (e) {{
       ko++;
@@ -524,15 +548,15 @@ pick.addEventListener('change', async () => {{
 </body></html>
 """, height=360)
 
-    # démarrer le thread
+    # démarrer le thread serveur
     t = threading.Thread(target=processor_thread, args=(rt, session_id), daemon=True)
     t.start()
 
-# Affichage progression
+# Tableau de suivi par client
 runner = rt["runner"]
-
-st.subheader("Traitement par client")
 clients = rt["clients"]
+
+st.subheader("Suivi traitement (par client)")
 if clients:
     import pandas as pd
     rows = []
@@ -541,9 +565,10 @@ if clients:
             rows.append({
                 "Client": c["name"],
                 "Adresse": c["address"],
-                "Normalisées": c["normalized_count"],
-                "En attente": len(c["buffer_paths"]),
-                "Images envoyées": c["files_sent"],
+                "Upload détecté (R2)": c["r2_seen_count"],
+                "Normalisés": c["normalized_count"],
+                "En attente (non envoyés)": len(c["buffer_paths"]),
+                "Images envoyées API": c["files_sent"],
                 "Collages envoyés": c["collages_sent"],
                 "Appels Fidealis": c["api_calls"],
                 "Statut": c["status"],
@@ -552,16 +577,24 @@ if clients:
     df = pd.DataFrame(rows)
     st.dataframe(df, use_container_width=True, hide_index=True)
 
+    # Barres de progression claires
     for cf, c in clients.items():
-        total = c["files_sent"] + len(c["buffer_paths"])
-        done = c["files_sent"]
-        pct = (done / total) if total else 0.0
-        st.write(f"{c['name']} — progression envoi API")
-        st.progress(pct)
-else:
-    st.info("Aucun client détecté pour l’instant.")
+        st.write(f"{c['name']} — Upload vers R2")
+        # On ne connaît pas le total exact à l'avance, donc on illustre la progression relative
+        # par le ratio normalisés / upload détecté pour voir si le serveur suit le rythme
+        uploaded = max(1, c["r2_seen_count"])
+        normalized = min(c["normalized_count"], uploaded)
+        st.progress(normalized/uploaded)
 
-st.subheader("Journal de traitement (serveur)")
+        st.write(f"{c['name']} — Envoi vers Fidealis")
+        sent = c["files_sent"]
+        # estimation: progress API = sent / uploaded (borne à 1)
+        st.progress(min(1.0, sent / max(1, uploaded)))
+else:
+    st.info("Aucun client détecté pour l’instant. Dès que l’upload commence, les clients apparaîtront ici.")
+
+# Journal
+st.subheader("Journal serveur (dernières lignes)")
 with LOCK:
     st.text("\n".join(rt["logs"][-400:]))
 
