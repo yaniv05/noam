@@ -1,7 +1,7 @@
 # app.py
-import os, io, re, json, uuid, base64, tempfile, math
+import os, io, re, json, uuid, base64, time, tempfile
 import requests, streamlit as st, boto3
-from typing import List, Tuple, Optional, Dict, Callable
+from typing import List, Tuple, Optional, Dict
 from PIL import Image, ImageOps, ImageFile
 import botocore.client
 
@@ -14,13 +14,13 @@ ACCOUNT_KEY = os.getenv("ACCOUNT_KEY")
 GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
 
 # ========= ENV (Cloudflare R2) =========
-R2_ACCOUNT_ID = os.getenv("R2_ACCOUNT_ID")           # ex: f02b01cf197682b810e6a39fdbcbaad3
+R2_ACCOUNT_ID = os.getenv("R2_ACCOUNT_ID")           # ex: f02b01cf...
 R2_BUCKET = os.getenv("R2_BUCKET")                   # ex: fidealis-demo
 R2_ACCESS_KEY_ID = os.getenv("R2_ACCESS_KEY_ID")
 R2_SECRET_ACCESS_KEY = os.getenv("R2_SECRET_ACCESS_KEY")
 R2_REGION = os.getenv("R2_REGION", "auto")
 
-# Virtual-hosted style (navigateur) + endpoint SDK (serveur)
+# Navigateur (virtual-hosted) & SDK endpoint
 R2_BUCKET_HOST = f"{R2_BUCKET}.{R2_ACCOUNT_ID}.r2.cloudflarestorage.com"
 R2_ENDPOINT = f"https://{R2_ACCOUNT_ID}.r2.cloudflarestorage.com"
 
@@ -46,43 +46,29 @@ def api_login() -> Optional[str]:
     except Exception:
         return None
 
-def api_upload_files(
-    description: str,
-    filepaths: List[str],
-    session_id: str,
-    log: Optional[Callable[[str], None]] = None,
-    progress_cb: Optional[Callable[[int, int], None]] = None
-):
-    """
-    Envoi à Fidealis par lots de 12 avec progression.
-    """
-    total_batches = math.ceil(len(filepaths) / 12) if filepaths else 0
-    for b_idx, i in enumerate(range(0, len(filepaths), 12), start=1):
-        batch = filepaths[i:i+12]
+def api_upload_files(description: str, filepaths: List[str], session_id: str, log_area=None):
+    total = len(filepaths)
+    if log_area:
+        log_area.write(f"📤 Envoi Fidealis de {total} fichier(s) en lots de 12...")
+    for start in range(0, total, 12):
+        batch = filepaths[start:start+12]
         data = {
             "key": API_KEY, "PHPSESSID": session_id, "call": "setDeposit",
             "description": description, "type":"deposit","hidden":"0","sendmail":"1","background":"2"
         }
-
-        if log:
-            log(f"📦 Lot {b_idx}/{total_batches} → {len(batch)} fichier(s) : " +
-                ", ".join(os.path.basename(x) for x in batch))
-
         for idx, fp in enumerate(batch, start=1):
             with open(fp, "rb") as f:
                 data[f"file{idx}"] = base64.b64encode(f.read()).decode("utf-8")
             data[f"filename{idx}"] = os.path.basename(fp)
-
-        # POST
-        r = requests.post(API_URL, data=data, timeout=60)
-        if log:
-            if r.ok:
-                log(f"✅ Lot {b_idx} OK (HTTP {r.status_code})")
-            else:
-                log(f"❌ Lot {b_idx} FAIL (HTTP {r.status_code}) — body: {r.text[:200]}")
-
-        if progress_cb:
-            progress_cb(b_idx, total_batches)
+        r = requests.post(API_URL, data=data, timeout=90)
+        # Log minimal des retours
+        try:
+            js = r.json()
+            if log_area:
+                log_area.write(f"   ↪️ Lot {start+1}-{start+len(batch)}: HTTP {r.status_code} – retour: {js}")
+        except Exception:
+            if log_area:
+                log_area.write(f"   ↪️ Lot {start+1}-{start+len(batch)}: HTTP {r.status_code}")
 
 def get_credit(session_id: str):
     try:
@@ -140,8 +126,7 @@ def create_all_collages(filepaths: List[str], client_name: str, workdir: str, ma
         group = filepaths[i:i+3]
         imgs=[]
         for fp in group:
-            with open(fp,"rb") as f:
-                jb = preprocess_to_jpeg_bytes(f.read(), max_dim=max_dim, quality=q)
+            with open(fp,"rb") as f: jb = preprocess_to_jpeg_bytes(f.read(), max_dim=max_dim, quality=q)
             imgs.append(Image.open(io.BytesIO(jb)))
         p = os.path.join(workdir, f"c_{client_name}_{len(out)+1}.jpg")
         create_collage(imgs, p, quality=q)
@@ -181,16 +166,15 @@ def group_by_client(keys: List[str], batch_prefix: str) -> Dict[str,List[str]]:
     for k in keys:
         if not k.startswith(batch_prefix) or k.endswith("/"):
             continue
-        rel = k[len(batch_prefix):]            # tout ce qui vient après uploads/<batch>/
-        if not samples and rel:
-            samples.append(rel)
+        rel = k[len(batch_prefix):]
+        if not samples and rel: samples.append(rel)
         client_seg = find_client_segment(rel)
         if client_seg:
             groups.setdefault(client_seg, []).append(k)
     for v in groups.values():
         v.sort()
     if not groups and samples:
-        st.warning(f"Exemple de chemin relatif (pour debug) : {samples[0]}")
+        st.warning(f"Exemple de chemin relatif (debug) : {samples[0]}")
     return groups
 
 # ---------- Diagnostic R2 ----------
@@ -203,8 +187,6 @@ def r2_health():
         st.success("head_bucket ✅")
     except Exception as e:
         st.error(f"head_bucket ❌ : {e}")
-
-    # Test PUT/GET serveur
     try:
         test_key = f"diagnostics/{uuid.uuid4()}-ping.txt"
         s3.put_object(Bucket=R2_BUCKET, Key=test_key, Body=b"ping")
@@ -214,6 +196,67 @@ def r2_health():
         s3.delete_object(Bucket=R2_BUCKET, Key=test_key)
     except Exception as e:
         st.error(f"PUT/GET serveur ❌ : {e}")
+
+# ---------- Traitement d'un batch ----------
+def process_batch(batch_id: str, max_dim: int, jpeg_q: int, session_id: str):
+    batch_prefix = f"uploads/{batch_id}/"
+    st.info(f"🚀 Traitement pour batch: **{batch_id}** (prefix: `{batch_prefix}`)")
+    # small retry: wait for keys to appear
+    keys = []
+    for attempt in range(6):
+        keys = list_objects(batch_prefix)
+        if keys: break
+        time.sleep(1.0)
+    st.write(f"🪣 {len(keys)} fichier(s) détecté(s) dans R2.")
+
+    groups = group_by_client(keys, batch_prefix)
+    if not groups:
+        st.error("Aucun dossier client `ClientName - Address` détecté sous ce batch.")
+        return
+
+    st.write(f"👥 {len(groups)} client(s) détecté(s).")
+    p_clients = st.progress(0.0)
+
+    for idx, (client_folder, client_keys) in enumerate(groups.items(), start=1):
+        parsed = split_client(client_folder)
+        if not parsed:
+            p_clients.progress(idx/len(groups)); continue
+
+        client_name, address = parsed
+        lat, lng = get_coordinates(address)
+        if lat is None or lng is None:
+            lat, lng = ("N/A","N/A")
+            st.warning(f"Géocodage indisponible : {client_folder}")
+
+        st.subheader(f"👤 {client_name}")
+        st.write(f"   • Images: {len(client_keys)}")
+        with tempfile.TemporaryDirectory(dir="/tmp") as tmpdir:
+            normalized: List[str] = []
+            p_imgs = st.progress(0.0, text=f"Prétraitement images — {client_name}")
+            for j, key in enumerate(client_keys, start=1):
+                buf = io.BytesIO()
+                s3.download_fileobj(R2_BUCKET, key, buf)
+                jb = preprocess_to_jpeg_bytes(buf.getvalue(), max_dim=max_dim, quality=jpeg_q)
+                outp = os.path.join(tmpdir, f"{client_name}_{j:05d}.jpg")
+                with open(outp,"wb") as o: o.write(jb)
+                normalized.append(outp)
+                p_imgs.progress(j/len(client_keys))
+
+            st.write(f"🧩 Création collages (par 3)…")
+            collages = create_all_collages(normalized, client_name, tmpdir, max_dim=max_dim, q=jpeg_q)
+            st.write(f"   • Collages: {len(collages)}")
+
+            description = (f"SCELLÉ NUMERIQUE Bénéficiaire: Nom: {client_name}, "
+                           f"Adresse: {address}, Coordonnées GPS: Latitude {lat}, Longitude {lng}")
+
+            log_area = st.empty()
+            api_upload_files(description, collages, session_id, log_area=log_area)
+
+        st.success(f"✅ {client_name} — {len(collages)} collage(s) envoyé(s).")
+        p_clients.progress(idx/len(groups))
+
+    st.balloons()
+    st.success("🎉 Batch terminé.")
 
 # ========== UI ==========
 st.set_page_config(page_title="FIDEALIS — Dossier → R2 → Traitement auto", layout="centered")
@@ -235,111 +278,36 @@ with st.expander("Options de traitement"):
     max_dim = st.slider("Dimension max (px) avant collage", 800, 4000, 1600, step=100)
     jpeg_q  = st.slider("Qualité JPEG", 50, 95, 80, step=1)
 
-# --- Query params ---
+# --- Query params (si tu veux garder le mode ?batch=...) ---
 try:
     params = st.query_params
 except Exception:
     params = st.experimental_get_query_params()
 
-# --- Mode post-upload (?batch=...) ---
 if "batch" in params:
-    batch_id = params["batch"] if isinstance(params["batch"], str) else params["batch"][0]
-    batch_prefix = f"uploads/{batch_id}/"
-    st.info(f"Traitement en cours pour le batch : {batch_id}")
-
-    keys = list_objects(batch_prefix)
-    st.write(f"📦 {len(keys)} fichier(s) détecté(s) dans R2 sous {batch_prefix}")
-    groups = group_by_client(keys, batch_prefix)
-    if not groups:
-        st.error("Aucun dossier client `ClientName - Address` détecté sous ce batch.")
-        st.stop()
-
-    st.write(f"👥 {len(groups)} client(s) détecté(s).")
-    p_clients = st.progress(0.0)
-
-    for idx, (client_folder, client_keys) in enumerate(groups.items(), start=1):
-        parsed = split_client(client_folder)
-        if not parsed:
-            p_clients.progress(idx/len(groups)); continue
-        client_name, address = parsed
-        lat, lng = get_coordinates(address)
-        if lat is None or lng is None:
-            lat, lng = ("N/A","N/A")
-            st.warning(f"Géocodage indisponible : {client_folder}")
-
-        st.subheader(f"👤 {client_name}")
-        st.caption(f"{len(client_keys)} image(s)")
-
-        with tempfile.TemporaryDirectory(dir="/tmp") as tmpdir:
-            # Progression normalisation d'images
-            p_imgs = st.progress(0.0)
-            normalized: List[str] = []
-            for j, key in enumerate(client_keys, start=1):
-                buf = io.BytesIO()
-                s3.download_fileobj(R2_BUCKET, key, buf)
-                jb = preprocess_to_jpeg_bytes(buf.getvalue(), max_dim=max_dim, quality=jpeg_q)
-                outp = os.path.join(tmpdir, f"{client_name}_{j:05d}.jpg")
-                with open(outp,"wb") as o: o.write(jb)
-                normalized.append(outp)
-                p_imgs.progress(j/len(client_keys))
-
-            # Collages
-            st.caption("Création des collages…")
-            collages = create_all_collages(normalized, client_name, tmpdir, max_dim=max_dim, q=jpeg_q)
-            st.success(f"{len(collages)} collage(s) créé(s)")
-
-            # Envoi Fidealis avec progression par lot
-            st.caption("Envoi à Fidealis (lots de 12)…")
-            p_batches = st.progress(0.0)
-            log_area = st.empty()
-
-            def log_line(msg: str):
-                prev = log_area.text_area if hasattr(log_area, "last") else ""
-                # simple append sans relire : on garde en mémoire la dernière concat
-                log_area.last = (getattr(log_area, "last", "") + msg + "\n")
-                log_area.text_area("Logs d’envoi Fidealis", value=log_area.last, height=160)
-
-            def p_cb(done: int, total: int):
-                p_batches.progress(done/total if total else 1.0)
-
-            api_upload_files(
-                description=(f"SCELLÉ NUMERIQUE Bénéficiaire: Nom: {client_name}, "
-                             f"Adresse: {address}, Coordonnées GPS: Latitude {lat}, Longitude {lng}"),
-                filepaths=collages,
-                session_id=session_id,
-                log=log_line,
-                progress_cb=p_cb
-            )
-
-        st.success(f"✅ {client_name} — {len(collages)} collage(s) envoyé(s).")
-        p_clients.progress(idx/len(groups))
-
-    st.balloons(); st.success("🎉 Batch terminé.")
+    batch_id_param = params["batch"] if isinstance(params["batch"], str) else params["batch"][0]
+    process_batch(batch_id_param, max_dim, jpeg_q, session_id)
     st.stop()
 
 # --- Ecran initial : upload -> R2 (PUT signé) ---
-st.markdown("### 1 clic : choisir le dossier et **Soumettre**")
-st.caption("Sélectionne le dossier racine (qui contient les sous-dossiers `ClientName - Address`).")
-if st.button("Sélectionner un dossier et Soumettre", type="primary"):
+st.markdown("### 1) Uploade un dossier complet → R2, puis traite-le")
+
+if st.button("Sélectionner un dossier et Uploader vers R2", type="primary"):
     if not all([R2_ACCOUNT_ID, R2_BUCKET, R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY]):
         st.error("R2 env manquantes (ACCOUNT_ID/BUCKET/ACCESS_KEY/SECRET).")
         st.stop()
 
     batch_id = str(uuid.uuid4())
+    st.session_state["last_batch_id"] = batch_id  # 🔴 on mémorise côté serveur
     prefix = f"uploads/{batch_id}/"
 
+    # IFRAME: pas de redirection top-level (interdite). On affiche juste les logs d’upload.
     st.components.v1.html(f"""
 <!doctype html><html>
 <body>
 <input id="picker" type="file" webkitdirectory directory multiple style="display:none" />
 <button id="go" style="padding:10px 16px;font-size:16px;">Choisir le dossier…</button>
-
-<div style="margin-top:10px;">
-  <progress id="prog" value="0" max="100" style="width:100%;height:16px;"></progress>
-  <div id="pc" style="font:12px sans-serif;margin-top:4px;">0%</div>
-</div>
-
-<pre id="log" style="white-space:pre-wrap;border:1px solid #eee;padding:8px;border-radius:6px;max-height:220px;overflow:auto;margin-top:10px;"></pre>
+<pre id="log" style="white-space:pre-wrap;border:1px solid #eee;padding:8px;border-radius:6px;max-height:280px;overflow:auto;margin-top:10px;"></pre>
 
 <script type="module">
 import {{ AwsClient }} from "https://esm.sh/aws4fetch@1.0.17";
@@ -361,9 +329,6 @@ const client = new AwsClient({{
 
 const log = (m)=>document.getElementById('log').textContent += m + "\\n";
 const pick = document.getElementById('picker');
-const bar = document.getElementById('prog');
-const pc  = document.getElementById('pc');
-
 document.getElementById('go').addEventListener('click', ()=> pick.click());
 
 function normRelPath(rel) {{
@@ -371,11 +336,6 @@ function normRelPath(rel) {{
 }}
 function keyFor(rel) {{
   return PREFIX + normRelPath(rel);
-}}
-
-function upd(i, n){{
-  const pct = Math.round((i*100)/n);
-  bar.value = pct; pc.textContent = pct + "%";
 }}
 
 pick.addEventListener('change', async () => {{
@@ -394,7 +354,7 @@ pick.addEventListener('change', async () => {{
 
   const K = 8; // parallélisme
   const queue = items.slice();
-  let done=0, ko=0;
+  let ok=0, ko=0;
 
   async function uploadOne(it) {{
     const url = `https://${{BUCKET_HOST}}/${{keyFor(it.rel)}}`;
@@ -406,26 +366,28 @@ pick.addEventListener('change', async () => {{
     }});
     const dt = ((performance.now()-t0)/1000).toFixed(2);
     if (!res.ok) throw new Error(`HTTP ${{res.status}}`);
-    done++;
-    if (done % 10 === 0) log(`... ${{done}}/${{items.length}} OK`);
-    upd(done, items.length);
+    ok++; if (ok % 10 === 0) log(`... ${{ok}}/${{items.length}} OK`);
   }}
 
   async function worker() {{
     while (queue.length) {{
       const it = queue.shift();
       try {{ await uploadOne(it); }}
-      catch(e) {{ ko++; log("FAIL "+it.rel+" :: "+(e && e.message?e.message:e)); done++; upd(done, items.length); }}
+      catch(e) {{ ko++; log("FAIL "+it.rel+" :: "+(e && e.message?e.message:e)); }}
     }}
   }}
 
   await Promise.all(Array.from({{length:K}}, worker));
-  log(`Terminé — OK=${{done - ko}}, FAIL=${{ko}}`);
-
-  const target = window.top.location.origin + window.top.location.pathname + "?batch=" + BATCH_ID;
-  window.top.location.href = target;
+  log(`Terminé — OK=${{ok}}, FAIL=${{ko}}`);
+  log("ℹ️ Revenez dans l’application et cliquez sur “Traiter ce batch maintenant”.");
 }});
 </script>
 </body></html>
-""", height=380)
-    st.stop()
+""", height=360)
+
+# Bouton manuel (fiable) pour lancer le traitement sans redirection
+last = st.session_state.get("last_batch_id")
+if last:
+    st.info(f"Batch prêt: **{last}**")
+    if st.button("✅ Traiter ce batch maintenant"):
+        process_batch(last, max_dim, jpeg_q, session_id)
