@@ -1,10 +1,12 @@
 # app.py
-import os, io, re, json, uuid, base64, time, tempfile
+import os, io, re, json, uuid, base64, time, tempfile, threading, shutil
 import requests, streamlit as st, boto3
 from typing import List, Tuple, Optional, Dict, Set
 from PIL import Image, ImageOps, ImageFile
 import botocore.client
+from datetime import datetime
 
+# ---------- PIL tolère certains JPEG tronqués ----------
 ImageFile.LOAD_TRUNCATED_IMAGES = True
 
 # ========= ENV (Fidealis) =========
@@ -20,7 +22,7 @@ R2_ACCESS_KEY_ID = os.getenv("R2_ACCESS_KEY_ID")
 R2_SECRET_ACCESS_KEY = os.getenv("R2_SECRET_ACCESS_KEY")
 R2_REGION = os.getenv("R2_REGION", "auto")
 
-# Navigateur (virtual-hosted) & SDK endpoint
+# Navigateur (virtual-hosted) & SDK endpoint (boto3)
 R2_BUCKET_HOST = f"{R2_BUCKET}.{R2_ACCOUNT_ID}.r2.cloudflarestorage.com"
 R2_ENDPOINT = f"https://{R2_ACCOUNT_ID}.r2.cloudflarestorage.com"
 
@@ -34,8 +36,21 @@ s3 = boto3.client(
     config=botocore.client.Config(s3={"addressing_style": "virtual"})
 )
 
+# ========= Constantes =========
 IMG_EXTS = {".jpg",".jpeg",".png",".JPG",".JPEG",".PNG"}
-CLIENT_RE = re.compile(r"^\s*(.+?)\s*-\s*(.+?)\s*$")
+CLIENT_RE = re.compile(r"^\s*(.+?)\s*-\s*(.+?)\s*$")  # "ClientName - Address"
+
+# ========= Utilitaires =========
+def now_str() -> str:
+    return datetime.now().strftime("%H:%M:%S")
+
+def safe_join(*parts: str) -> str:
+    p = os.path.join(*parts)
+    os.makedirs(os.path.dirname(p), exist_ok=True)
+    return p
+
+def slug(s: str) -> str:
+    return re.sub(r"[^a-zA-Z0-9._-]+", "_", s).strip("_")
 
 # ---------- Fidealis ----------
 def api_login() -> Optional[str]:
@@ -46,11 +61,11 @@ def api_login() -> Optional[str]:
     except Exception:
         return None
 
-def api_upload_files(description: str, filepaths: List[str], session_id: str, log_write):
+def api_upload_files(description: str, filepaths: List[str], session_id: str, log_cb):
     total = len(filepaths)
     if total == 0:
         return
-    log_write(f"Envoi Fidealis: {total} fichier(s), lots de 12.")
+    log_cb(f"{now_str()}  Envoi Fidealis: {total} fichier(s) en lots de 12")
     for start in range(0, total, 12):
         batch = filepaths[start:start+12]
         data = {
@@ -65,11 +80,11 @@ def api_upload_files(description: str, filepaths: List[str], session_id: str, lo
             r = requests.post(API_URL, data=data, timeout=120)
             try:
                 js = r.json()
-                log_write(f"  Lot {start+1}-{start+len(batch)}: HTTP {r.status_code} — retour: {js}")
+                log_cb(f"{now_str()}    Lot {start+1}-{start+len(batch)}: HTTP {r.status_code} — retour: {js}")
             except Exception:
-                log_write(f"  Lot {start+1}-{start+len(batch)}: HTTP {r.status_code}")
+                log_cb(f"{now_str()}    Lot {start+1}-{start+len(batch)}: HTTP {r.status_code}")
         except Exception as e:
-            log_write(f"  Lot {start+1}-{start+len(batch)}: erreur requête: {e}")
+            log_cb(f"{now_str()}    Lot {start+1}-{start+len(batch)}: erreur requête: {e}")
 
 def get_credit(session_id: str):
     try:
@@ -172,224 +187,258 @@ def group_keys_by_client(keys: List[str], batch_prefix: str) -> Dict[str, List[s
         v.sort()
     return groups
 
-# ---------- Diagnostic R2 ----------
-def r2_health():
-    st.subheader("Diagnostic R2")
-    st.write("Bucket host (navigateur):", R2_BUCKET_HOST)
-    st.write("Endpoint (SDK):", R2_ENDPOINT)
-    try:
-        s3.head_bucket(Bucket=R2_BUCKET)
-        st.success("head_bucket OK")
-    except Exception as e:
-        st.error(f"head_bucket erreur: {e}")
-    try:
-        test_key = f"diagnostics/{uuid.uuid4()}-ping.txt"
-        s3.put_object(Bucket=R2_BUCKET, Key=test_key, Body=b"ping")
-        obj = s3.get_object(Bucket=R2_BUCKET, Key=test_key)
-        body = obj["Body"].read()
-        st.success(f"PUT/GET serveur OK ({body!r})")
-        s3.delete_object(Bucket=R2_BUCKET, Key=test_key)
-    except Exception as e:
-        st.error(f"PUT/GET serveur erreur: {e}")
+# ========= État partagé (thread) =========
+LOCK = threading.Lock()
 
-# ---------- Traitement en flux (live) ----------
-class LiveState:
-    def __init__(self):
-        self.seen_by_client: Dict[str, Set[str]] = {}    # clés déjà traitées (téléchargées + normalisées)
-        self.buffer_by_client: Dict[str, List[str]] = {} # chemins locaux normalisés en attente de collage/envoi
+def init_state():
+    # structure : st.session_state["runner"] et st.session_state["clients"]
+    if "runner" not in st.session_state:
+        st.session_state["runner"] = {
+            "batch_id": None,
+            "running": False,
+            "started_ts": None,
+            "last_update": None,
+            "inactivity_s": 45.0,
+            "poll_s": 2.0,
+            "max_dim": 1600,
+            "jpeg_q": 80,
+            "root_tmp": None,
+            "ended": False,
+            "error": None,
+        }
+    if "clients" not in st.session_state:
+        st.session_state["clients"] = {}  # client_folder -> dict
+    if "global_log" not in st.session_state:
+        st.session_state["global_log"] = []
+    if "upload_panel_shown" not in st.session_state:
+        st.session_state["upload_panel_shown"] = False
 
-def process_ready_chunks(client_name: str, address: str, latlng: Tuple[Optional[float],Optional[float]],
-                         buffer_paths: List[str], jpeg_q: int, session_id: str, log_write):
-    # Prend par paquets de 36 images -> collages -> envoi
-    count = len(buffer_paths)
-    n_chunks = count // 36
-    if n_chunks == 0:
-        return 0
-    used = 0
-    with tempfile.TemporaryDirectory(dir="/tmp") as tmpdir2:
-        for c in range(n_chunks):
-            block = buffer_paths[c*36:(c+1)*36]
-            collages = create_collages_from_paths(block, client_name, tmpdir2, q=jpeg_q)
-            lat, lng = latlng
-            description = (f"SCELLÉ NUMERIQUE Bénéficiaire: Nom: {client_name}, "
-                           f"Adresse: {address}, Coordonnées GPS: Latitude {lat}, Longitude {lng}")
-            api_upload_files(description, collages, session_id, log_write)
-            used += len(block)
-    return used
+def append_log(msg: str):
+    with LOCK:
+        st.session_state["global_log"].append(msg)
+        # keep last 1000 lines
+        if len(st.session_state["global_log"]) > 1000:
+            st.session_state["global_log"] = st.session_state["global_log"][-1000:]
 
-def live_watch_and_process(batch_id: str, max_dim: int, jpeg_q: int, session_id: str,
-                           inactivity_stop_s: int, poll_every_s: float, log_write):
+def ensure_client(client_folder: str, name: str, address: str):
+    clients = st.session_state["clients"]
+    if client_folder not in clients:
+        lat, lng = get_coordinates(address)
+        if lat is None or lng is None:
+            lat, lng = ("N/A", "N/A")
+        clients[client_folder] = {
+            "name": name,
+            "address": address,
+            "lat": lat, "lng": lng,
+            "seen_keys": set(),               # clés R2 déjà normalisées
+            "normalized_count": 0,            # nb images normalisées sur disque
+            "buffer_paths": [],               # chemins locaux en attente d'envoi
+            "files_sent": 0,                  # nb images déjà envoyées (par blocs de 36)
+            "collages_sent": 0,               # nb collages envoyés
+            "api_calls": 0,                   # nb appels Fidealis faits
+            "status": "en attente",
+            "last_event": now_str(),
+        }
+
+def client_root_dir(batch_root: str, client_folder: str) -> str:
+    return os.path.join(batch_root, slug(client_folder))
+
+# ========= Thread de traitement =========
+def processor_thread():
+    runner = st.session_state["runner"]
+    batch_id = runner["batch_id"]
     batch_prefix = f"uploads/{batch_id}/"
-    log_write(f"Traitement en direct pour batch: {batch_id} (prefix {batch_prefix})")
-    state = LiveState()
-    last_progress_ts = time.time()
+    root_tmp = runner["root_tmp"]
+    inactivity_s = float(runner["inactivity_s"])
+    poll_s = float(runner["poll_s"])
+    max_dim = int(runner["max_dim"])
+    jpeg_q = int(runner["jpeg_q"])
 
-    while True:
-        keys = list_objects(batch_prefix)
-        groups = group_keys_by_client(keys, batch_prefix)
-        updated_something = False
+    session_id = st.session_state.get("fidealis_session_id")
+    if not session_id:
+        append_log(f"{now_str()}  Erreur: session Fidealis absente")
+        with LOCK:
+            runner["running"] = False
+            runner["ended"] = True
+            runner["error"] = "Session Fidealis absente"
+        return
 
-        for client_folder, client_keys in groups.items():
-            parsed = split_client(client_folder)
-            if not parsed:
-                continue
-            client_name, address = parsed
-            if client_folder not in state.seen_by_client:
-                state.seen_by_client[client_folder] = set()
-                state.buffer_by_client[client_folder] = []
-                log_write(f"Nouveau client détecté: {client_name} — {address}")
+    append_log(f"{now_str()}  Démarrage traitement batch {batch_id}")
+    last_activity = time.time()
 
-            seen = state.seen_by_client[client_folder]
-            buf  = state.buffer_by_client[client_folder]
+    try:
+        while True:
+            # 1) lister clés et grouper par client
+            keys = list_objects(batch_prefix)
+            groups = group_keys_by_client(keys, batch_prefix)
+            updated = False
 
-            # Prétraiter uniquement les nouvelles clés
-            new_keys = [k for k in client_keys if k not in seen]
-            if new_keys:
-                # Récupérer lat/lng à la première occasion
-                lat, lng = get_coordinates(address)
-                if lat is None or lng is None:
-                    lat, lng = ("N/A", "N/A")
-                # Télécharger et normaliser
-                with tempfile.TemporaryDirectory(dir="/tmp") as tmpdir:
-                    for j, key in enumerate(new_keys, start=1):
+            for client_folder, client_keys in groups.items():
+                parsed = split_client(client_folder)
+                if not parsed:
+                    continue
+                client_name, address = parsed
+                ensure_client(client_folder, client_name, address)
+                c = st.session_state["clients"][client_folder]
+                c["status"] = "traitement"
+                c["last_event"] = now_str()
+
+                # 2) nouvelles clés
+                new_keys = [k for k in client_keys if k not in c["seen_keys"]]
+                if new_keys:
+                    updated = True
+                    # normaliser et stocker localement
+                    cdir = client_root_dir(root_tmp, client_folder)
+                    os.makedirs(cdir, exist_ok=True)
+                    for key in new_keys:
                         try:
                             b = io.BytesIO()
                             s3.download_fileobj(R2_BUCKET, key, b)
                             jb = preprocess_to_jpeg_bytes(b.getvalue(), max_dim=max_dim, quality=jpeg_q)
-                            outp = os.path.join(tmpdir, f"{uuid.uuid4().hex}.jpg")
+                            outp = safe_join(cdir, f"{uuid.uuid4().hex}.jpg")
                             with open(outp, "wb") as o: o.write(jb)
-                            # On garde une copie locale persistante pour le batch courant
-                            # pour limiter l'usage disque, on recopie vers /tmp global client
-                            # Ici on garde tel quel dans mem: on ajoute chemin temp courant
-                            # Note: chaque itération de tmpdir va être détruite:
-                            # -> on recopie dans un fichier durable:
-                            durable = os.path.join("/tmp", f"{uuid.uuid4().hex}.jpg")
-                            with open(outp, "rb") as i, open(durable, "wb") as o2:
-                                o2.write(i.read())
-                            buf.append(durable)
-                            seen.add(key)
+                            c["buffer_paths"].append(outp)
+                            c["normalized_count"] += 1
+                            c["seen_keys"].add(key)
                         except Exception as e:
-                            log_write(f"Erreur normalisation {key}: {e}")
-                # Dès qu'on a des multiples de 36, on envoie
-                used = process_ready_chunks(client_name, address, (lat,lng), buf, jpeg_q, session_id, log_write)
-                if used > 0:
-                    del buf[:used]
-                    updated_something = True
+                            append_log(f"{now_str()}  Normalisation en échec {key}: {e}")
 
-        now = time.time()
-        if updated_something:
-            last_progress_ts = now
-        # Arrêt si inactif trop longtemps
-        if now - last_progress_ts > inactivity_stop_s:
-            log_write(f"Aucune nouvelle image depuis {inactivity_stop_s}s. Arrêt du mode en direct.")
-            break
+                    # 3) dès qu'on a des multiples de 36, on envoie
+                    blocks = len(c["buffer_paths"]) // 36
+                    if blocks > 0:
+                        used_total = 0
+                        for _ in range(blocks):
+                            block = c["buffer_paths"][:36]
+                            # collages pour ce block
+                            tmp_send = safe_join(root_tmp, f"send_{uuid.uuid4().hex}", "")
+                            os.makedirs(tmp_send, exist_ok=True)
+                            collages = create_collages_from_paths(block, c["name"], tmp_send, q=jpeg_q)
+                            description = (f"SCELLÉ NUMERIQUE Bénéficiaire: Nom: {c['name']}, "
+                                           f"Adresse: {c['address']}, Coordonnées GPS: Latitude {c['lat']}, Longitude {c['lng']}")
+                            # appel Fidealis
+                            api_upload_files(description, collages, session_id, append_log)
+                            c["files_sent"] += len(block)
+                            c["collages_sent"] += len(collages)
+                            c["api_calls"] += max(1, (len(collages)+11)//12)
+                            # ménage
+                            try:
+                                shutil.rmtree(tmp_send, ignore_errors=True)
+                            except Exception:
+                                pass
+                            del c["buffer_paths"][:36]
+                            used_total += 36
+                        append_log(f"{now_str()}  Client {c['name']}: bloc(s) de 36 traité(s) x{blocks}")
+                # status
+                st.session_state["clients"][client_folder] = c
 
-        time.sleep(poll_every_s)
+            if updated:
+                last_activity = time.time()
 
-    # A la fin, on ne force pas la vidange ici: l’utilisateur clique "Finaliser"
-    log_write("Mode en direct terminé.")
+            # inactivité => finalisation reliquats et stop
+            if time.time() - last_activity > inactivity_s:
+                append_log(f"{now_str()}  Inactivité {int(inactivity_s)}s: finalisation des reliquats")
+                # finalisation
+                for client_folder, c in list(st.session_state["clients"].items()):
+                    if not c["buffer_paths"]:
+                        continue
+                    tmp_send = safe_join(root_tmp, f"send_{uuid.uuid4().hex}", "")
+                    os.makedirs(tmp_send, exist_ok=True)
+                    collages = create_collages_from_paths(c["buffer_paths"], c["name"], tmp_send, q=jpeg_q)
+                    description = (f"SCELLÉ NUMERIQUE Bénéficiaire: Nom: {c['name']}, "
+                                   f"Adresse: {c['address']}, Coordonnées GPS: Latitude {c['lat']}, Longitude {c['lng']}")
+                    api_upload_files(description, collages, session_id, append_log)
+                    c["files_sent"] += len(c["buffer_paths"])
+                    c["collages_sent"] += len(collages)
+                    c["api_calls"] += max(1, (len(collages)+11)//12) if collages else 0
+                    c["buffer_paths"].clear()
+                    c["status"] = "terminé"
+                    c["last_event"] = now_str()
+                    try:
+                        shutil.rmtree(tmp_send, ignore_errors=True)
+                    except Exception:
+                        pass
+                    st.session_state["clients"][client_folder] = c
+                break
 
-def finalize_leftovers(batch_id: str, jpeg_q: int, session_id: str, log_write):
-    # On relit tout puis on envoie le reliquat par client (< 36 aussi)
-    batch_prefix = f"uploads/{batch_id}/"
-    keys = list_objects(batch_prefix)
-    groups = group_keys_by_client(keys, batch_prefix)
-    if not groups:
-        log_write("Aucun client trouvé lors de la finalisation.")
-        return
-    for client_folder, client_keys in groups.items():
-        parsed = split_client(client_folder)
-        if not parsed:
-            continue
-        client_name, address = parsed
-        lat, lng = get_coordinates(address)
-        if lat is None or lng is None:
-            lat, lng = ("N/A","N/A")
+            time.sleep(poll_s)
 
-        log_write(f"Finalisation client: {client_name}")
-        # Télécharger/normaliser à nouveau pour simplicité (petit coût, mais fiable)
-        normalized: List[str] = []
-        with tempfile.TemporaryDirectory(dir="/tmp") as tmpdir:
-            for key in client_keys:
-                try:
-                    b = io.BytesIO()
-                    s3.download_fileobj(R2_BUCKET, key, b)
-                    jb = preprocess_to_jpeg_bytes(b.getvalue(), max_dim=1600, quality=jpeg_q)
-                    outp = os.path.join(tmpdir, f"{uuid.uuid4().hex}.jpg")
-                    with open(outp, "wb") as o: o.write(jb)
-                    normalized.append(outp)
-                except Exception as e:
-                    log_write(f"Erreur normalisation {key}: {e}")
+    except Exception as e:
+        append_log(f"{now_str()}  Erreur fatale traitement: {e}")
+        with LOCK:
+            runner["error"] = str(e)
 
-            if not normalized:
-                log_write("Aucune image normalisée.")
-                continue
+    finally:
+        with LOCK:
+            runner["running"] = False
+            runner["ended"] = True
+        append_log(f"{now_str()}  Traitement terminé")
+        # Option: nettoyer l’arborescence /tmp du batch
+        try:
+            shutil.rmtree(root_tmp, ignore_errors=True)
+        except Exception:
+            pass
 
-            # Collages par 3, puis envoyer en lots de 12 fichiers
-            collages = create_collages_from_paths(normalized, client_name, tmpdir, q=jpeg_q)
-            description = (f"SCELLÉ NUMERIQUE Bénéficiaire: Nom: {client_name}, "
-                           f"Adresse: {address}, Coordonnées GPS: Latitude {lat}, Longitude {lng}")
-            api_upload_files(description, collages, session_id, log_write)
-        log_write(f"Finalisation terminée pour {client_name}.")
+# ========= UI =========
+st.set_page_config(page_title="FIDEALIS — Dossier → R2 → Traitement automatique", layout="wide")
+st.title("FIDEALIS — Dossier → R2 → Collages → Dépôt (automatique)")
 
-# ========== UI ==========
-st.set_page_config(page_title="FIDEALIS — Dossier → R2 → Traitement auto", layout="centered")
-st.title("FIDEALIS — Dossier → R2 → Collages → Dépôt")
+init_state()
 
+# Connexion Fidealis
 session_id = api_login()
 if not session_id:
     st.error("Connexion Fidealis échouée (API_URL/API_KEY/ACCOUNT_KEY).")
     st.stop()
+st.session_state["fidealis_session_id"] = session_id
 
 credits = get_credit(session_id)
 if isinstance(credits, dict):
     st.caption(f"Crédit restant (Produit 4) : {get_quantity_for_product_4(credits)}")
 
-with st.expander("Diagnostic R2", expanded=False):
-    r2_health()
-
+# Options
 with st.expander("Options de traitement"):
-    max_dim = st.slider("Dimension max (px) avant collage", 800, 4000, 1600, step=100)
-    jpeg_q  = st.slider("Qualité JPEG", 50, 95, 80, step=1)
-    inactivity_stop_s = st.slider("Arrêt auto du live s'il n'y a plus de nouvelles images (secondes)", 10, 300, 45, step=5)
-    poll_every_s = st.slider("Intervalle de polling R2 (secondes)", 0.5, 5.0, 2.0, step=0.5)
+    st.session_state["runner"]["max_dim"] = st.slider("Dimension max (px) avant collage", 800, 4000, st.session_state["runner"]["max_dim"], step=100)
+    st.session_state["runner"]["jpeg_q"]  = st.slider("Qualité JPEG", 50, 95, st.session_state["runner"]["jpeg_q"], step=1)
+    st.session_state["runner"]["inactivity_s"] = st.slider("Arrêt auto si plus de nouvelles images (s)", 10, 300, int(st.session_state["runner"]["inactivity_s"]), step=5)
+    st.session_state["runner"]["poll_s"] = st.slider("Intervalle de polling R2 (s)", 0.5, 5.0, float(st.session_state["runner"]["poll_s"]), step=0.5)
 
-# Zone de logs
-log_box = st.empty()
-def log_write(msg: str):
-    old = st.session_state.get("log_text", "")
-    new = old + (msg.strip() + "\n")
-    st.session_state["log_text"] = new
-    log_box.text(new if len(new) < 20000 else new[-20000:])  # limite d'affichage
+# Démarrage : un seul bouton “Choisir dossier…”
+colA, colB = st.columns([1,2])
+with colA:
+    start_clicked = st.button("Choisir le dossier et tout lancer", type="primary")
+with colB:
+    st.write("Après sélection, l’upload vers R2 démarre et le traitement s’exécute en parallèle. Le suivi apparaît ci-dessous.")
 
-# --- Query params: support ?batch=... (optionnel) ---
-try:
-    params = st.query_params
-except Exception:
-    params = st.experimental_get_query_params()
-
-if "batch" in params:
-    st.session_state["last_batch_id"] = params["batch"] if isinstance(params["batch"], str) else params["batch"][0]
-    st.info(f"Batch détecté dans l'URL: {st.session_state['last_batch_id']}")
-
-# --- Ecran initial: upload -> R2 (PUT signé) ---
-st.markdown("Étape 1. Uploader un dossier complet vers R2")
-
-if st.button("Choisir le dossier et uploader vers R2", type="primary"):
+if start_clicked:
     if not all([R2_ACCOUNT_ID, R2_BUCKET, R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY]):
-        st.error("R2: variables d'environnement manquantes (ACCOUNT_ID/BUCKET/ACCESS_KEY/SECRET).")
+        st.error("R2: variables d’environnement manquantes (ACCOUNT_ID/BUCKET/ACCESS_KEY/SECRET).")
         st.stop()
 
-    batch_id = str(uuid.uuid4())
-    st.session_state["last_batch_id"] = batch_id
-    prefix = f"uploads/{batch_id}/"
+    # reset état
+    st.session_state["clients"].clear()
+    st.session_state["global_log"].clear()
 
+    batch_id = str(uuid.uuid4())
+    runner = st.session_state["runner"]
+    runner["batch_id"] = batch_id
+    runner["running"] = True
+    runner["ended"] = False
+    runner["error"] = None
+    runner["started_ts"] = now_str()
+    runner["last_update"] = now_str()
+    runner["root_tmp"] = os.path.join("/tmp", f"batch_{batch_id}")
+    os.makedirs(runner["root_tmp"], exist_ok=True)
+
+    # Panneau Upload (navigateur → R2 via PUT signé)
+    prefix = f"uploads/{batch_id}/"
+    st.session_state["upload_panel_shown"] = True
+    st.subheader("Upload vers R2 (client)")
     st.components.v1.html(f"""
 <!doctype html><html>
 <body>
 <input id="picker" type="file" webkitdirectory directory multiple style="display:none" />
 <button id="go" style="padding:10px 16px;">Choisir le dossier…</button>
-<pre id="log" style="white-space:pre-wrap;border:1px solid #eee;padding:8px;border-radius:6px;max-height:280px;overflow:auto;margin-top:10px;"></pre>
+<pre id="log" style="white-space:pre-wrap;border:1px solid #ccc;padding:8px;border-radius:6px;max-height:280px;overflow:auto;margin-top:10px;"></pre>
 
 <script type="module">
 import {{ AwsClient }} from "https://esm.sh/aws4fetch@1.0.17";
@@ -449,12 +498,11 @@ pick.addEventListener('change', async () => {{
       ok++;
       if ((ok+ko) % 10 === 0) {{
         const pct = Math.round(((ok+ko)/items.length)*100);
-        log(`Progression: ${{ok+ko}}/${{items.length}} (${{pct}}%)`);
-
+        log(`Progression upload: ${{ok+ko}}/${{items.length}} (${{pct}}%)`);
       }}
     }} catch (e) {{
       ko++;
-      log("Echec: " + it.rel + " :: " + (e && e.message ? e.message : e));
+      log("Echec upload: " + it.rel + " :: " + (e && e.message ? e.message : e));
     }}
   }}
 
@@ -467,35 +515,67 @@ pick.addEventListener('change', async () => {{
 
   await Promise.all(Array.from({{length:K}}, worker));
   const dt = ((performance.now()-tStart)/1000).toFixed(1);
-  log(`Terminé. OK=${{ok}}, FAIL=${{ko}}. Durée: ${{dt}}s`);
-  log("Reviens dans l'application et lance le traitement en direct ou la finalisation.");
+  log(`Upload terminé. OK=${{ok}}, FAIL=${{ko}}. Durée: ${{dt}}s`);
 }});
 </script>
 </body></html>
 """, height=360)
 
-# Étape 2: traitement live (parallèle à l'upload)
-st.markdown("Étape 2. Traitement en direct pendant l'upload (tranches de 36 par client)")
+    # Lance le thread de traitement immédiatement
+    t = threading.Thread(target=processor_thread, daemon=True)
+    t.start()
 
-col1, col2 = st.columns(2)
-with col1:
-    if st.button("Démarrer le traitement en direct"):
-        batch_id = st.session_state.get("last_batch_id")
-        if not batch_id:
-            st.error("Aucun batch en mémoire. Lance d'abord l'upload.")
-        else:
-            log_write(f"Début du traitement en direct pour batch {batch_id}")
-            live_watch_and_process(batch_id, max_dim, jpeg_q, session_id,
-                                   inactivity_stop_s=inactivity_stop_s,
-                                   poll_every_s=poll_every_s,
-                                   log_write=log_write)
+# Affichages de suivi (se mettent à jour automatiquement)
+runner = st.session_state["runner"]
 
-with col2:
-    if st.button("Finaliser (envoyer le reliquat)"):
-        batch_id = st.session_state.get("last_batch_id")
-        if not batch_id:
-            st.error("Aucun batch en mémoire. Lance d'abord l'upload.")
-        else:
-            log_write(f"Finalisation du batch {batch_id}")
-            finalize_leftovers(batch_id, jpeg_q, session_id, log_write)
-            log_write("Finalisation terminée.")
+# Auto-refresh léger pendant que ça tourne
+if runner["running"] and not runner["ended"]:
+    st.experimental_rerun  # no-op placeholder to remind; Streamlit auto-reruns on UI events
+st_autorefresh_ms = 1000 if runner["running"] and not runner["ended"] else 0
+if st_autorefresh_ms:
+    st.experimental_set_query_params(batch=runner["batch_id"])
+    st.autorefresh(interval=st_autorefresh_ms, key="auto_refresh_key", limit=None)
+
+# Panneau progression traitement
+st.subheader("Traitement par client")
+clients = st.session_state["clients"]
+if clients:
+    # tableau synthétique
+    import pandas as pd
+    rows = []
+    for cf, c in clients.items():
+        rows.append({
+            "Client": c["name"],
+            "Adresse": c["address"],
+            "Normalisées": c["normalized_count"],
+            "En attente (buffer)": len(c["buffer_paths"]),
+            "Images envoyées": c["files_sent"],
+            "Collages envoyés": c["collages_sent"],
+            "Appels Fidealis": c["api_calls"],
+            "Statut": c["status"],
+            "Dernier évènement": c["last_event"],
+        })
+    df = pd.DataFrame(rows)
+    st.dataframe(df, use_container_width=True, hide_index=True)
+
+    # barres de progression par client (approx: envoyées / (normalisées + en attente))
+    for cf, c in clients.items():
+        total = c["files_sent"] + len(c["buffer_paths"])
+        done = c["files_sent"]
+        pct = (done / total) if total else 0.0
+        st.write(f"{c['name']} — progression envoi API")
+        st.progress(pct)
+
+else:
+    st.info("Aucun client détecté pour l’instant.")
+
+# Logs serveur
+st.subheader("Journal de traitement (serveur)")
+st.text("\n".join(st.session_state["global_log"][-400:]))
+
+# État final
+if runner["ended"]:
+    if runner["error"]:
+        st.error(f"Terminé avec erreur: {runner['error']}")
+    else:
+        st.success("Traitement terminé.")
