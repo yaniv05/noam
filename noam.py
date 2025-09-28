@@ -6,13 +6,13 @@ from PIL import Image, ImageOps, ImageFile
 
 ImageFile.LOAD_TRUNCATED_IMAGES = True
 
-# ===== Env (Fidealis) =====
+# ===== ENV (Fidealis) =====
 API_URL = os.getenv("API_URL")
 API_KEY = os.getenv("API_KEY")
 ACCOUNT_KEY = os.getenv("ACCOUNT_KEY")
 GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
 
-# ===== Env (Cloudflare R2) =====
+# ===== ENV (Cloudflare R2) =====
 R2_ACCOUNT_ID = os.getenv("R2_ACCOUNT_ID")
 R2_ACCESS_KEY_ID = os.getenv("R2_ACCESS_KEY_ID")
 R2_SECRET_ACCESS_KEY = os.getenv("R2_SECRET_ACCESS_KEY")
@@ -20,7 +20,7 @@ R2_BUCKET = os.getenv("R2_BUCKET")
 R2_REGION = os.getenv("R2_REGION", "auto")
 R2_ENDPOINT = f"https://{R2_ACCOUNT_ID}.r2.cloudflarestorage.com"
 
-# ===== Clients =====
+# ===== S3 client (R2) =====
 s3 = boto3.client(
     "s3",
     region_name=R2_REGION,
@@ -122,12 +122,20 @@ def create_all_collages(filepaths: List[str], client_name: str, workdir: str, ma
 
 # ---------- R2 util ----------
 def r2_presign_post_for_prefix(prefix: str, max_mb=2048, expires=3600):
+    """
+    IMPORTANT: on NE fige PAS 'Content-Type' ni 'key' ici.
+    On autorise:
+      - starts-with $key = prefix
+      - starts-with $Content-Type = "" (n'importe lequel)
+      - range taille
+    Le champ 'key' sera fourni côté navigateur (clé = prefix + chemin relatif).
+    """
     return s3.generate_presigned_post(
         Bucket=R2_BUCKET,
-        Key=prefix + "${filename}",
-        Fields={"Content-Type":"application/octet-stream"},
+        Key=prefix + "${filename}",   # valeur placeholder
+        Fields={},                    # <-- vide, on évite d'imposer 'key' / 'Content-Type'
         Conditions=[
-            ["starts-with","$key",prefix],
+            ["starts-with","$key", prefix],
             ["starts-with","$Content-Type",""],
             ["content-length-range", 1, max_mb*1024*1024],
         ],
@@ -154,15 +162,15 @@ def group_by_client(keys: List[str], batch_prefix: str) -> Dict[str,List[str]]:
     groups: Dict[str,List[str]] = {}
     for k in keys:
         if not k.startswith(batch_prefix) or k.endswith("/"): continue
-        rel = k[len(batch_prefix):]                  # "<Client - Address>/.../file.jpg"
-        top = rel.split("/",1)[0]                    # "<Client - Address>"
+        rel = k[len(batch_prefix):]
+        top = rel.split("/",1)[0]
         if split_client(top):
             groups.setdefault(top, []).append(k)
     for v in groups.values(): v.sort()
     return groups
 
 # ========== UI ==========
-st.set_page_config(page_title="FIDEALIS — Upload dossier → R2 → Traitement auto", layout="centered")
+st.set_page_config(page_title="FIDEALIS — Dossier → R2 → Traitement auto", layout="centered")
 st.title("FIDEALIS — Dossier → R2 (auto) → Collages → Dépôt")
 
 session_id = api_login()
@@ -178,7 +186,7 @@ with st.expander("Options de traitement"):
     max_dim = st.slider("Dimension max (px) avant collage", 800, 4000, 1600, step=100)
     jpeg_q  = st.slider("Qualité JPEG", 50, 95, 80, step=1)
 
-# ------------- MODE 1 : déclenché par ?batch=... (post-upload) -------------
+# --- Mode post-upload (?batch=...) ---
 params = st.query_params
 if "batch" in params:
     batch_id = params["batch"]
@@ -226,18 +234,13 @@ if "batch" in params:
     st.balloons(); st.success("🎉 Batch terminé.")
     st.stop()
 
-# ------------- MODE 2 : écran initial (un seul bouton) -------------
+# --- Ecran initial : 1 bouton ---
 st.markdown("### 1 clic : choisir le dossier et **Soumettre**")
 if st.button("Sélectionner un dossier et Soumettre", type="primary"):
-    # 1) créer un batch + presign « starts-with »
     batch_id = str(uuid.uuid4())
     prefix = f"uploads/{batch_id}/"
     post = r2_presign_post_for_prefix(prefix, max_mb=2048, expires=3600)
 
-    # 2) injecter un composant HTML qui :
-    #    - ouvre un sélecteur de dossier (webkitdirectory)
-    #    - uploade **tous** les fichiers en parallèle vers R2 (clé = prefix + chemin relatif)
-    #    - à la fin → redirige la page vers ?batch=<batch_id> (le serveur traitera automatiquement)
     st.components.v1.html(f"""
 <!doctype html><html><body>
 <input id="picker" type="file" webkitdirectory directory multiple style="display:none" />
@@ -246,34 +249,20 @@ if st.button("Sélectionner un dossier et Soumettre", type="primary"):
 <script>
 const pres = {json.dumps(post)};
 const prefix = {json.dumps(prefix)};
+const batchId = {json.dumps(batch_id)};
 const log = (m)=>document.getElementById('log').textContent += m + "\\n";
-
 const pick = document.getElementById('picker');
+
 document.getElementById('go').addEventListener('click', ()=> pick.click());
 
 function keyFor(rel) {{
   return (prefix + rel.replace(/^\\.\\//,'').replaceAll('\\\\','/'));
 }}
 
-async function uploadOne(file, relPath) {{
-  const key = keyFor(relPath);
-  const form = new FormData();
-  Object.entries(pres.fields).forEach(([k,v])=>form.append(k,v));
-  form.append('key', key);
-  form.append('Content-Type', file.type || 'application/octet-stream');
-  form.append('file', file);
-  const t0 = performance.now();
-  const res = await fetch(pres.url, {{ method:'POST', body: form }});
-  const dt = ((performance.now()-t0)/1000).toFixed(2);
-  if (!res.ok) throw new Error(`HTTP ${{res.status}}`);
-  log(`OK ${'{'}relPath{'}'} → ${'{'}key{'}'} (${ '{'}dt{'}'}s)`);
-}}
-
-pick.addEventListener('change', async (ev) => {{
+pick.addEventListener('change', async () => {{
   const files = Array.from(pick.files||[]);
   if (!files.length) {{ log("Aucun fichier sélectionné."); return; }}
 
-  // Limiter aux extensions images seulement (serveur re-filtrera aussi)
   const allowed = new Set([".jpg",".jpeg",".png",".JPG",".JPEG",".PNG"]);
   const items = files
     .map(f=>{{ const rel=f.webkitRelativePath||f.name;
@@ -282,22 +271,40 @@ pick.addEventListener('change', async (ev) => {{
     .filter(x=> allowed.has(x.ext));
 
   if (!items.length) {{ log("Aucune image détectée dans le dossier."); return; }}
-
   log(`Fichiers détectés: ${{items.length}} — upload en parallèle…`);
-  const K = 8; // parallélisme
-  const q = items.slice();
+
+  const K = 8;             // parallélisme
+  const queue = items.slice();
   let done=0;
-  const worker = async ()=>{{
-    while(q.length){{
-      const it=q.shift();
-      try {{ await uploadOne(it.file, it.rel); }}
-      catch(e) {{ log("FAIL "+it.rel+" :: "+e.message); }}
-      done++; if (done%10===0) log(`... ${{done}}/${{items.length}}`);
+
+  async function uploadOne(it) {{
+    const form = new FormData();
+    // IMPORTANT: ne pas copier 'key' ni 'Content-Type' depuis pres.fields
+    for (const [k,v] of Object.entries(pres.fields)) {{
+      if (k !== 'key' && k !== 'Content-Type') form.append(k, v);
     }}
-  }};
+    form.append('key', keyFor(it.rel));    // notre clé dynamique (avec sous-dossiers)
+    // ne PAS ajouter de field 'Content-Type' → laisser S3 accepter n'importe lequel (policy starts-with)
+    form.append('file', it.file);
+
+    const t0 = performance.now();
+    const res = await fetch(pres.url, {{ method:'POST', body: form }});
+    const dt = ((performance.now()-t0)/1000).toFixed(2);
+    if (!res.ok) throw new Error(`HTTP ${{res.status}}`);
+    if (++done % 10 === 0) log(`... ${{done}}/${{items.length}}`);
+  }}
+
+  async function worker() {{
+    while (queue.length) {{
+      const it = queue.shift();
+      try {{ await uploadOne(it); }}
+      catch(e) {{ log("FAIL "+it.rel+" :: "+e.message); }}
+    }}
+  }}
+
   await Promise.all(Array.from({{length:K}}, worker));
-  // Rediriger vers ?batch=<id> pour lancer le traitement côté serveur
-  window.location.search = "?batch=" + {json.dumps(batch_id)};
+  // redirige vers le traitement serveur
+  window.location.search = "?batch=" + batchId;
 }});
 </script>
 </body></html>
