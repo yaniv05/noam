@@ -134,17 +134,17 @@ def r2_presign_post_for_prefix(prefix: str, max_mb=2048, expires=3600):
     """
     post = s3.generate_presigned_post(
         Bucket=R2_BUCKET,
-        Key=prefix + "${filename}",   # placeholder
-        Fields={},                    # pas de 'key' / 'Content-Type' figés
+        Key=prefix + "${filename}",
+        Fields={},
         Conditions=[
-            ["starts-with", "$key", prefix],
-            ["starts-with", "$Content-Type", ""],
-            ["content-length-range", 1, max_mb * 1024 * 1024],
+            ["starts-with","$key", prefix],
+            ["starts-with","$Content-Type",""],
+            ["content-length-range", 1, 1024*1024*1024],
         ],
-        ExpiresIn=expires,
+        ExpiresIn=3600,
     )
-
-    # ⚠️ Correction ici : boto3 renvoie parfois juste la racine, on force avec le bucket
+    
+    # ⚠️ Correction de l’URL
     post["url"] = f"{R2_ENDPOINT}/{R2_BUCKET}"
     return post
 
