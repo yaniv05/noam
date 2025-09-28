@@ -3,6 +3,7 @@ import os, io, re, json, uuid, base64, tempfile
 import requests, streamlit as st, boto3
 from typing import List, Tuple, Optional, Dict
 from PIL import Image, ImageOps, ImageFile
+import botocore.client
 
 # --- Tolérer certains JPEG tronqués ---
 ImageFile.LOAD_TRUNCATED_IMAGES = True
@@ -29,7 +30,9 @@ s3 = boto3.client(
     endpoint_url=R2_ENDPOINT,
     aws_access_key_id=R2_ACCESS_KEY_ID,
     aws_secret_access_key=R2_SECRET_ACCESS_KEY,
+    config=botocore.client.Config(s3={"addressing_style": "virtual"})
 )
+
 
 IMG_EXTS = {".jpg",".jpeg",".png",".JPG",".JPEG",".PNG"}
 CLIENT_RE = re.compile(r"^\s*(.+?)\s*-\s*(.+?)\s*$")
