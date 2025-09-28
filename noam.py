@@ -449,7 +449,8 @@ pick.addEventListener('change', async () => {{
       ok++;
       if ((ok+ko) % 10 === 0) {{
         const pct = Math.round(((ok+ko)/items.length)*100);
-        log(`Progression: ${{ok+ko}}/${{items.length}} (${pct}%)`);
+        log(`Progression: ${{ok+ko}}/${{items.length}} (${{pct}}%)`);
+
       }}
     }} catch (e) {{
       ko++;
