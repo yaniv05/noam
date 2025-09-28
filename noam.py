@@ -8,22 +8,24 @@ import botocore.client
 # --- Tolérer certains JPEG tronqués ---
 ImageFile.LOAD_TRUNCATED_IMAGES = True
 
-# ===== ENV (Fidealis) =====
+# ========= ENV (Fidealis) =========
 API_URL = os.getenv("API_URL")
 API_KEY = os.getenv("API_KEY")
 ACCOUNT_KEY = os.getenv("ACCOUNT_KEY")
 GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
 
-# ===== ENV (Cloudflare R2) =====
-R2_ACCOUNT_ID = os.getenv("R2_ACCOUNT_ID")
+# ========= ENV (Cloudflare R2) =========
+R2_ACCOUNT_ID = os.getenv("R2_ACCOUNT_ID")           # ex: f02b01cf197682b810e6a39fdbcbaad3
+R2_BUCKET = os.getenv("R2_BUCKET")                   # ex: fidealis-demo
 R2_ACCESS_KEY_ID = os.getenv("R2_ACCESS_KEY_ID")
 R2_SECRET_ACCESS_KEY = os.getenv("R2_SECRET_ACCESS_KEY")
-R2_BUCKET = os.getenv("R2_BUCKET")  # ex: "fidealis-demo"
 R2_REGION = os.getenv("R2_REGION", "auto")
-R2_ENDPOINT = f"https://{R2_ACCOUNT_ID}.r2.cloudflarestorage.com"  # endpoint S3 API (sans /bucket)
 
-# ===== S3 client (R2) =====
-# Important: addressing_style=virtual pour que R2 travaille en virtual-hosted style
+# Virtual-hosted style requis côté navigateur:
+R2_BUCKET_HOST = f"{R2_BUCKET}.{R2_ACCOUNT_ID}.r2.cloudflarestorage.com"
+R2_ENDPOINT = f"https://{R2_ACCOUNT_ID}.r2.cloudflarestorage.com"  # endpoint S3 pour boto3
+
+# ========= S3 client (boto3) pour le serveur =========
 s3 = boto3.client(
     "s3",
     region_name=R2_REGION,
@@ -124,27 +126,7 @@ def create_all_collages(filepaths: List[str], client_name: str, workdir: str, ma
         os.replace(out[0], renamed); out[0] = renamed
     return out
 
-# ---------- R2 util ----------
-def r2_presign_post_for_prefix(prefix: str, max_mb=2048, expires=3600):
-    """
-    Pre-signed POST réutilisable pour TOUTE clé commençant par `prefix`.
-    On n'impose pas 'key' ni 'Content-Type' dans Fields → on les ajoute côté navigateur.
-    """
-    post = s3.generate_presigned_post(
-        Bucket=R2_BUCKET,
-        Key=prefix + "${filename}",
-        Fields={},
-        Conditions=[
-            ["starts-with","$key", prefix],
-            ["starts-with","$Content-Type",""],
-            ["content-length-range", 1, max_mb * 1024 * 1024],
-        ],
-        ExpiresIn=expires,
-    )
-    # ⚠️ FORCER l’URL pour inclure /<bucket>, sinon POST va à la racine → 501
-    post["url"] = f"{R2_ENDPOINT}/{R2_BUCKET}"
-    return post
-
+# ---------- R2 utils serveur ----------
 def list_objects(prefix: str) -> List[str]:
     keys, token = [], None
     while True:
@@ -172,92 +154,27 @@ def group_by_client(keys: List[str], batch_prefix: str) -> Dict[str,List[str]]:
     for v in groups.values(): v.sort()
     return groups
 
-# ---------- DIAGNOSTIC R2 ----------
-def r2_health(server_prefix="diagnostics/"):
+# ---------- Diagnostic R2 ----------
+def r2_health():
     st.subheader("🔍 Diagnostic R2")
-    st.write("Endpoint S3 API:", R2_ENDPOINT)
-    st.write("Bucket:", R2_BUCKET)
-    st.write("Region:", R2_REGION or "auto")
-    st.write("Access Key ID (fin):", (R2_ACCESS_KEY_ID or "")[-4:] if R2_ACCESS_KEY_ID else "ABSENT")
-    st.write("Secret (présent ?):", "OK" if R2_SECRET_ACCESS_KEY else "ABSENT")
-
+    st.write("Bucket host:", R2_BUCKET_HOST)
+    st.write("Endpoint (SDK):", R2_ENDPOINT)
     try:
         s3.head_bucket(Bucket=R2_BUCKET)
         st.success("head_bucket ✅")
     except Exception as e:
         st.error(f"head_bucket ❌ : {e}")
 
-    test_key = f"{server_prefix}{uuid.uuid4()}-ping.txt"
+    # Petit test PUT/GET côté serveur
     try:
+        test_key = f"diagnostics/{uuid.uuid4()}-ping.txt"
         s3.put_object(Bucket=R2_BUCKET, Key=test_key, Body=b"ping")
-        st.success("put_object ✅")
         obj = s3.get_object(Bucket=R2_BUCKET, Key=test_key)
         body = obj["Body"].read()
-        st.success(f"get_object ✅ (contenu={body!r})")
+        st.success(f"PUT/GET serveur ✅ ({body!r})")
         s3.delete_object(Bucket=R2_BUCKET, Key=test_key)
-        st.success("delete_object ✅")
     except Exception as e:
-        st.error(f"put/get/delete ❌ : {e}")
-
-    # Presigned POST de test (⚠️ forcer l’URL avec /bucket)
-    try:
-        test_prefix = f"{server_prefix}{uuid.uuid4()}/"
-        pres = s3.generate_presigned_post(
-            Bucket=R2_BUCKET,
-            Key=test_prefix + "${filename}",
-            Fields={},
-            Conditions=[
-                ["starts-with","$key", test_prefix],
-                ["starts-with","$Content-Type",""],
-                ["content-length-range", 1, 1024 * 1024],
-            ],
-            ExpiresIn=600,
-        )
-        pres["url"] = f"{R2_ENDPOINT}/{R2_BUCKET}"   # <<< important
-        st.info(f"Préfixe de test: `{test_prefix}`")
-        st.write("Presigned POST URL (diagnostic):", pres["url"])
-
-        st.components.v1.html(f"""
-<html><body>
-<button id="btn" style="padding:8px 12px;">Tester upload navigateur → R2</button>
-<pre id="out" style="white-space:pre-wrap;border:1px solid #eee;padding:8px;max-height:220px;overflow:auto;margin-top:8px;border-radius:6px;"></pre>
-<script>
-const pres = {json.dumps(pres)};
-const prefix = {json.dumps(test_prefix)};
-const log = m => document.getElementById('out').textContent += m + "\\n";
-
-log("pres.url = " + pres.url);
-
-async function testUpload() {{
-  const filename = "ping.txt";
-  const key = prefix + filename;
-  log("🔑 key = " + key);
-
-  const blob = new Blob(["hello-r2"], {{type: "text/plain"}});
-  const form = new FormData();
-  for (const [k,v] of Object.entries(pres.fields)) {{
-    if (k !== 'key' && k !== 'Content-Type') form.append(k, v);
-  }}
-  form.append('key', key);
-  form.append('file', blob);
-
-  try {{
-    const res = await fetch(pres.url, {{ method: 'POST', body: form }});
-    let text = "";
-    try {{ text = await res.text(); }} catch (e) {{ text = "(body non lisible)" }}
-    if (res.ok) log("POST ✅ " + res.status);
-    else {{ log("POST ❌ HTTP " + res.status); log("Body: " + text); }}
-  }} catch (e) {{
-    log("POST ❌ Failed to fetch: " + (e && e.message ? e.message : e));
-    log("=> Probable CORS / mauvaise URL / connectivité.");
-  }}
-}}
-document.getElementById('btn').addEventListener('click', testUpload);
-</script>
-</body></html>
-""", height=300)
-    except Exception as e:
-        st.error(f"Préparation pre-signed POST ❌ : {e}")
+        st.error(f"PUT/GET serveur ❌ : {e}")
 
 # ========== UI ==========
 st.set_page_config(page_title="FIDEALIS — Dossier → R2 → Traitement auto", layout="centered")
@@ -272,16 +189,16 @@ credits = get_credit(session_id)
 if isinstance(credits, dict):
     st.caption(f"Crédit restant (Produit 4) : {get_quantity_for_product_4(credits)}")
 
-with st.expander("🧪 Diagnostic R2 (si 'Failed to fetch')", expanded=False):
+with st.expander("🧪 Diagnostic R2", expanded=False):
     r2_health()
 
 with st.expander("Options de traitement"):
     max_dim = st.slider("Dimension max (px) avant collage", 800, 4000, 1600, step=100)
     jpeg_q  = st.slider("Qualité JPEG", 50, 95, 80, step=1)
 
-# --- Lecture des query params (compat large) ---
+# --- Query params ---
 try:
-    params = st.query_params  # Streamlit >= 1.30
+    params = st.query_params
 except Exception:
     params = st.experimental_get_query_params()
 
@@ -332,31 +249,51 @@ if "batch" in params:
     st.balloons(); st.success("🎉 Batch terminé.")
     st.stop()
 
-# --- Écran initial : 1 bouton ---
+# --- Écran initial : 1 bouton (upload direct navigateur → R2 par PUT signé) ---
 st.markdown("### 1 clic : choisir le dossier et **Soumettre**")
 if st.button("Sélectionner un dossier et Soumettre", type="primary"):
+    if not all([R2_ACCOUNT_ID, R2_BUCKET, R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY]):
+        st.error("R2 env manquantes (ACCOUNT_ID/BUCKET/ACCESS_KEY/SECRET).")
+        st.stop()
+
     batch_id = str(uuid.uuid4())
     prefix = f"uploads/{batch_id}/"
-    post = r2_presign_post_for_prefix(prefix, max_mb=2048, expires=3600)
 
+    # ⚠️ DÉMO SÉCURITÉ 0 : on expose les clés R2 dans la page pour signer côté navigateur
     st.components.v1.html(f"""
-<!doctype html><html><body>
+<!doctype html><html>
+<body>
 <input id="picker" type="file" webkitdirectory directory multiple style="display:none" />
 <button id="go" style="padding:10px 16px;font-size:16px;">Choisir le dossier…</button>
-<pre id="log" style="white-space:pre-wrap;border:1px solid #eee;padding:8px;border-radius:6px;max-height:240px;overflow:auto;margin-top:10px;"></pre>
-<script>
-const pres = {json.dumps(post)};
-const prefix = {json.dumps(prefix)};
-const batchId = {json.dumps(batch_id)};
+<pre id="log" style="white-space:pre-wrap;border:1px solid #eee;padding:8px;border-radius:6px;max-height:280px;overflow:auto;margin-top:10px;"></pre>
+
+<script type="module">
+import {{ AwsClient }} from "https://esm.sh/aws4fetch@1.0.17";
+
+const ACCESS_KEY_ID = {json.dumps(R2_ACCESS_KEY_ID)};
+const SECRET_ACCESS_KEY = {json.dumps(R2_SECRET_ACCESS_KEY)};
+const ACCOUNT_ID = {json.dumps(R2_ACCOUNT_ID)};
+const BUCKET = {json.dumps(R2_BUCKET)};
+const BUCKET_HOST = `${{BUCKET}}.${{ACCOUNT_ID}}.r2.cloudflarestorage.com`;
+const PREFIX = {json.dumps(prefix)};
+const BATCH_ID = {json.dumps(batch_id)};
+
+const client = new AwsClient({{
+  accessKeyId: ACCESS_KEY_ID,
+  secretAccessKey: SECRET_ACCESS_KEY,
+  service: "s3",
+  region: "auto"
+}});
+
 const log = (m)=>document.getElementById('log').textContent += m + "\\n";
 const pick = document.getElementById('picker');
-
-log("pres.url = " + pres.url);
-
 document.getElementById('go').addEventListener('click', ()=> pick.click());
 
+function normRelPath(rel) {{
+  return rel.replace(/^\\.\\//,'').replaceAll('\\\\','/'); // Windows → /
+}}
 function keyFor(rel) {{
-  return (prefix + rel.replace(/^\\.\\//,'').replaceAll('\\\\','/'));
+  return PREFIX + normRelPath(rel);
 }}
 
 pick.addEventListener('change', async () => {{
@@ -371,40 +308,41 @@ pick.addEventListener('change', async () => {{
     .filter(x=> allowed.has(x.ext));
 
   if (!items.length) {{ log("Aucune image détectée dans le dossier."); return; }}
-  log(`Fichiers détectés: ${{items.length}} — upload en parallèle…`);
+  log(`Fichiers détectés: ${{items.length}} — upload en parallèle (PUT signé)…`);
 
-  const K = 8;             // parallélisme
+  const K = 8; // parallélisme
   const queue = items.slice();
-  let done=0;
+  let ok=0, ko=0;
 
   async function uploadOne(it) {{
-    const key = keyFor(it.rel);
-    const form = new FormData();
-    for (const [k,v] of Object.entries(pres.fields)) {{
-      if (k !== 'key' && k !== 'Content-Type') form.append(k, v);
-    }}
-    form.append('key', key);
-    form.append('file', it.file);
-    try {{
-      const res = await fetch(pres.url, {{ method:'POST', body: form }});
-      if (!res.ok) throw new Error(`HTTP ${{res.status}}`);
-    }} catch(e) {{
-      log("FAIL "+it.rel+" :: " + e.message + " (key=" + key + ")");
-    }}
-    if (++done % 10 === 0) log(`... ${{done}}/${{items.length}}`);
+    const url = `https://${{BUCKET_HOST}}/${{keyFor(it.rel)}}`;
+    const t0 = performance.now();
+    // Requête signée automatiquement (Authorization) par aws4fetch:
+    const res = await client.fetch(url, {{
+      method: "PUT",
+      body: it.file,                       // pas de Content-Type signé → facultatif
+      headers: {{ "Content-Type": it.file.type || "application/octet-stream" }}
+    }});
+    const dt = ((performance.now()-t0)/1000).toFixed(2);
+    if (!res.ok) throw new Error(`HTTP ${{res.status}}`);
+    ok++; if (ok % 10 === 0) log(`... ${{ok}}/${{items.length}} OK`);
   }}
 
   async function worker() {{
     while (queue.length) {{
       const it = queue.shift();
-      await uploadOne(it);
+      try {{ await uploadOne(it); }}
+      catch(e) {{ ko++; log("FAIL "+it.rel+" :: "+(e && e.message?e.message:e)); }}
     }}
   }}
 
   await Promise.all(Array.from({{length:K}}, worker));
-  window.location.search = "?batch=" + batchId;
+
+  log(`Terminé — OK=${{ok}}, FAIL=${{ko}}`);
+  // Redirige vers traitement serveur
+  window.location.search = "?batch=" + BATCH_ID;
 }});
 </script>
 </body></html>
-""", height=320)
+""", height=360)
     st.stop()
