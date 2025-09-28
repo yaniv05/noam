@@ -1,7 +1,7 @@
 # app.py
 import os, io, re, json, uuid, base64, time, tempfile
 import requests, streamlit as st, boto3
-from typing import List, Tuple, Optional, Dict
+from typing import List, Tuple, Optional, Dict, Set
 from PIL import Image, ImageOps, ImageFile
 import botocore.client
 
@@ -14,8 +14,8 @@ ACCOUNT_KEY = os.getenv("ACCOUNT_KEY")
 GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
 
 # ========= ENV (Cloudflare R2) =========
-R2_ACCOUNT_ID = os.getenv("R2_ACCOUNT_ID")           # ex: f02b01cf...
-R2_BUCKET = os.getenv("R2_BUCKET")                   # ex: fidealis-demo
+R2_ACCOUNT_ID = os.getenv("R2_ACCOUNT_ID")
+R2_BUCKET = os.getenv("R2_BUCKET")
 R2_ACCESS_KEY_ID = os.getenv("R2_ACCESS_KEY_ID")
 R2_SECRET_ACCESS_KEY = os.getenv("R2_SECRET_ACCESS_KEY")
 R2_REGION = os.getenv("R2_REGION", "auto")
@@ -46,10 +46,11 @@ def api_login() -> Optional[str]:
     except Exception:
         return None
 
-def api_upload_files(description: str, filepaths: List[str], session_id: str, log_area=None):
+def api_upload_files(description: str, filepaths: List[str], session_id: str, log_write):
     total = len(filepaths)
-    if log_area:
-        log_area.write(f"📤 Envoi Fidealis de {total} fichier(s) en lots de 12...")
+    if total == 0:
+        return
+    log_write(f"Envoi Fidealis: {total} fichier(s), lots de 12.")
     for start in range(0, total, 12):
         batch = filepaths[start:start+12]
         data = {
@@ -60,15 +61,15 @@ def api_upload_files(description: str, filepaths: List[str], session_id: str, lo
             with open(fp, "rb") as f:
                 data[f"file{idx}"] = base64.b64encode(f.read()).decode("utf-8")
             data[f"filename{idx}"] = os.path.basename(fp)
-        r = requests.post(API_URL, data=data, timeout=90)
-        # Log minimal des retours
         try:
-            js = r.json()
-            if log_area:
-                log_area.write(f"   ↪️ Lot {start+1}-{start+len(batch)}: HTTP {r.status_code} – retour: {js}")
-        except Exception:
-            if log_area:
-                log_area.write(f"   ↪️ Lot {start+1}-{start+len(batch)}: HTTP {r.status_code}")
+            r = requests.post(API_URL, data=data, timeout=120)
+            try:
+                js = r.json()
+                log_write(f"  Lot {start+1}-{start+len(batch)}: HTTP {r.status_code} — retour: {js}")
+            except Exception:
+                log_write(f"  Lot {start+1}-{start+len(batch)}: HTTP {r.status_code}")
+        except Exception as e:
+            log_write(f"  Lot {start+1}-{start+len(batch)}: erreur requête: {e}")
 
 def get_credit(session_id: str):
     try:
@@ -120,20 +121,18 @@ def create_collage(pil_images: List[Image.Image], out_path: str, quality=80):
     canvas.close()
     for i in pil_images: i.close()
 
-def create_all_collages(filepaths: List[str], client_name: str, workdir: str, max_dim=1600, q=80) -> List[str]:
+def create_collages_from_paths(img_paths: List[str], client_name: str, workdir: str, q=80) -> List[str]:
     out = []
-    for i in range(0, len(filepaths), 3):
-        group = filepaths[i:i+3]
-        imgs=[]
-        for fp in group:
-            with open(fp,"rb") as f: jb = preprocess_to_jpeg_bytes(f.read(), max_dim=max_dim, quality=q)
-            imgs.append(Image.open(io.BytesIO(jb)))
+    for i in range(0, len(img_paths), 3):
+        group = img_paths[i:i+3]
+        imgs = [Image.open(p) for p in group]
         p = os.path.join(workdir, f"c_{client_name}_{len(out)+1}.jpg")
         create_collage(imgs, p, quality=q)
         out.append(p)
     if out:
         renamed = os.path.join(workdir, f"{client_name}_1.jpg")
-        os.replace(out[0], renamed); out[0] = renamed
+        os.replace(out[0], renamed)
+        out[0] = renamed
     return out
 
 # ---------- R2 (serveur) ----------
@@ -160,107 +159,182 @@ def find_client_segment(path_rel: str) -> Optional[str]:
             return seg
     return None
 
-def group_by_client(keys: List[str], batch_prefix: str) -> Dict[str,List[str]]:
+def group_keys_by_client(keys: List[str], batch_prefix: str) -> Dict[str, List[str]]:
     groups: Dict[str,List[str]] = {}
-    samples = []
     for k in keys:
         if not k.startswith(batch_prefix) or k.endswith("/"):
             continue
         rel = k[len(batch_prefix):]
-        if not samples and rel: samples.append(rel)
         client_seg = find_client_segment(rel)
         if client_seg:
             groups.setdefault(client_seg, []).append(k)
     for v in groups.values():
         v.sort()
-    if not groups and samples:
-        st.warning(f"Exemple de chemin relatif (debug) : {samples[0]}")
     return groups
 
 # ---------- Diagnostic R2 ----------
 def r2_health():
-    st.subheader("🔍 Diagnostic R2")
-    st.write("Bucket host (browser):", R2_BUCKET_HOST)
+    st.subheader("Diagnostic R2")
+    st.write("Bucket host (navigateur):", R2_BUCKET_HOST)
     st.write("Endpoint (SDK):", R2_ENDPOINT)
     try:
         s3.head_bucket(Bucket=R2_BUCKET)
-        st.success("head_bucket ✅")
+        st.success("head_bucket OK")
     except Exception as e:
-        st.error(f"head_bucket ❌ : {e}")
+        st.error(f"head_bucket erreur: {e}")
     try:
         test_key = f"diagnostics/{uuid.uuid4()}-ping.txt"
         s3.put_object(Bucket=R2_BUCKET, Key=test_key, Body=b"ping")
         obj = s3.get_object(Bucket=R2_BUCKET, Key=test_key)
         body = obj["Body"].read()
-        st.success(f"PUT/GET serveur ✅ ({body!r})")
+        st.success(f"PUT/GET serveur OK ({body!r})")
         s3.delete_object(Bucket=R2_BUCKET, Key=test_key)
     except Exception as e:
-        st.error(f"PUT/GET serveur ❌ : {e}")
+        st.error(f"PUT/GET serveur erreur: {e}")
 
-# ---------- Traitement d'un batch ----------
-def process_batch(batch_id: str, max_dim: int, jpeg_q: int, session_id: str):
+# ---------- Traitement en flux (live) ----------
+class LiveState:
+    def __init__(self):
+        self.seen_by_client: Dict[str, Set[str]] = {}    # clés déjà traitées (téléchargées + normalisées)
+        self.buffer_by_client: Dict[str, List[str]] = {} # chemins locaux normalisés en attente de collage/envoi
+
+def process_ready_chunks(client_name: str, address: str, latlng: Tuple[Optional[float],Optional[float]],
+                         buffer_paths: List[str], jpeg_q: int, session_id: str, log_write):
+    # Prend par paquets de 36 images -> collages -> envoi
+    count = len(buffer_paths)
+    n_chunks = count // 36
+    if n_chunks == 0:
+        return 0
+    used = 0
+    with tempfile.TemporaryDirectory(dir="/tmp") as tmpdir2:
+        for c in range(n_chunks):
+            block = buffer_paths[c*36:(c+1)*36]
+            collages = create_collages_from_paths(block, client_name, tmpdir2, q=jpeg_q)
+            lat, lng = latlng
+            description = (f"SCELLÉ NUMERIQUE Bénéficiaire: Nom: {client_name}, "
+                           f"Adresse: {address}, Coordonnées GPS: Latitude {lat}, Longitude {lng}")
+            api_upload_files(description, collages, session_id, log_write)
+            used += len(block)
+    return used
+
+def live_watch_and_process(batch_id: str, max_dim: int, jpeg_q: int, session_id: str,
+                           inactivity_stop_s: int, poll_every_s: float, log_write):
     batch_prefix = f"uploads/{batch_id}/"
-    st.info(f"🚀 Traitement pour batch: **{batch_id}** (prefix: `{batch_prefix}`)")
-    # small retry: wait for keys to appear
-    keys = []
-    for attempt in range(6):
+    log_write(f"Traitement en direct pour batch: {batch_id} (prefix {batch_prefix})")
+    state = LiveState()
+    last_progress_ts = time.time()
+
+    while True:
         keys = list_objects(batch_prefix)
-        if keys: break
-        time.sleep(1.0)
-    st.write(f"🪣 {len(keys)} fichier(s) détecté(s) dans R2.")
+        groups = group_keys_by_client(keys, batch_prefix)
+        updated_something = False
 
-    groups = group_by_client(keys, batch_prefix)
+        for client_folder, client_keys in groups.items():
+            parsed = split_client(client_folder)
+            if not parsed:
+                continue
+            client_name, address = parsed
+            if client_folder not in state.seen_by_client:
+                state.seen_by_client[client_folder] = set()
+                state.buffer_by_client[client_folder] = []
+                log_write(f"Nouveau client détecté: {client_name} — {address}")
+
+            seen = state.seen_by_client[client_folder]
+            buf  = state.buffer_by_client[client_folder]
+
+            # Prétraiter uniquement les nouvelles clés
+            new_keys = [k for k in client_keys if k not in seen]
+            if new_keys:
+                # Récupérer lat/lng à la première occasion
+                lat, lng = get_coordinates(address)
+                if lat is None or lng is None:
+                    lat, lng = ("N/A", "N/A")
+                # Télécharger et normaliser
+                with tempfile.TemporaryDirectory(dir="/tmp") as tmpdir:
+                    for j, key in enumerate(new_keys, start=1):
+                        try:
+                            b = io.BytesIO()
+                            s3.download_fileobj(R2_BUCKET, key, b)
+                            jb = preprocess_to_jpeg_bytes(b.getvalue(), max_dim=max_dim, quality=jpeg_q)
+                            outp = os.path.join(tmpdir, f"{uuid.uuid4().hex}.jpg")
+                            with open(outp, "wb") as o: o.write(jb)
+                            # On garde une copie locale persistante pour le batch courant
+                            # pour limiter l'usage disque, on recopie vers /tmp global client
+                            # Ici on garde tel quel dans mem: on ajoute chemin temp courant
+                            # Note: chaque itération de tmpdir va être détruite:
+                            # -> on recopie dans un fichier durable:
+                            durable = os.path.join("/tmp", f"{uuid.uuid4().hex}.jpg")
+                            with open(outp, "rb") as i, open(durable, "wb") as o2:
+                                o2.write(i.read())
+                            buf.append(durable)
+                            seen.add(key)
+                        except Exception as e:
+                            log_write(f"Erreur normalisation {key}: {e}")
+                # Dès qu'on a des multiples de 36, on envoie
+                used = process_ready_chunks(client_name, address, (lat,lng), buf, jpeg_q, session_id, log_write)
+                if used > 0:
+                    del buf[:used]
+                    updated_something = True
+
+        now = time.time()
+        if updated_something:
+            last_progress_ts = now
+        # Arrêt si inactif trop longtemps
+        if now - last_progress_ts > inactivity_stop_s:
+            log_write(f"Aucune nouvelle image depuis {inactivity_stop_s}s. Arrêt du mode en direct.")
+            break
+
+        time.sleep(poll_every_s)
+
+    # A la fin, on ne force pas la vidange ici: l’utilisateur clique "Finaliser"
+    log_write("Mode en direct terminé.")
+
+def finalize_leftovers(batch_id: str, jpeg_q: int, session_id: str, log_write):
+    # On relit tout puis on envoie le reliquat par client (< 36 aussi)
+    batch_prefix = f"uploads/{batch_id}/"
+    keys = list_objects(batch_prefix)
+    groups = group_keys_by_client(keys, batch_prefix)
     if not groups:
-        st.error("Aucun dossier client `ClientName - Address` détecté sous ce batch.")
+        log_write("Aucun client trouvé lors de la finalisation.")
         return
-
-    st.write(f"👥 {len(groups)} client(s) détecté(s).")
-    p_clients = st.progress(0.0)
-
-    for idx, (client_folder, client_keys) in enumerate(groups.items(), start=1):
+    for client_folder, client_keys in groups.items():
         parsed = split_client(client_folder)
         if not parsed:
-            p_clients.progress(idx/len(groups)); continue
-
+            continue
         client_name, address = parsed
         lat, lng = get_coordinates(address)
         if lat is None or lng is None:
             lat, lng = ("N/A","N/A")
-            st.warning(f"Géocodage indisponible : {client_folder}")
 
-        st.subheader(f"👤 {client_name}")
-        st.write(f"   • Images: {len(client_keys)}")
+        log_write(f"Finalisation client: {client_name}")
+        # Télécharger/normaliser à nouveau pour simplicité (petit coût, mais fiable)
+        normalized: List[str] = []
         with tempfile.TemporaryDirectory(dir="/tmp") as tmpdir:
-            normalized: List[str] = []
-            p_imgs = st.progress(0.0, text=f"Prétraitement images — {client_name}")
-            for j, key in enumerate(client_keys, start=1):
-                buf = io.BytesIO()
-                s3.download_fileobj(R2_BUCKET, key, buf)
-                jb = preprocess_to_jpeg_bytes(buf.getvalue(), max_dim=max_dim, quality=jpeg_q)
-                outp = os.path.join(tmpdir, f"{client_name}_{j:05d}.jpg")
-                with open(outp,"wb") as o: o.write(jb)
-                normalized.append(outp)
-                p_imgs.progress(j/len(client_keys))
+            for key in client_keys:
+                try:
+                    b = io.BytesIO()
+                    s3.download_fileobj(R2_BUCKET, key, b)
+                    jb = preprocess_to_jpeg_bytes(b.getvalue(), max_dim=1600, quality=jpeg_q)
+                    outp = os.path.join(tmpdir, f"{uuid.uuid4().hex}.jpg")
+                    with open(outp, "wb") as o: o.write(jb)
+                    normalized.append(outp)
+                except Exception as e:
+                    log_write(f"Erreur normalisation {key}: {e}")
 
-            st.write(f"🧩 Création collages (par 3)…")
-            collages = create_all_collages(normalized, client_name, tmpdir, max_dim=max_dim, q=jpeg_q)
-            st.write(f"   • Collages: {len(collages)}")
+            if not normalized:
+                log_write("Aucune image normalisée.")
+                continue
 
+            # Collages par 3, puis envoyer en lots de 12 fichiers
+            collages = create_collages_from_paths(normalized, client_name, tmpdir, q=jpeg_q)
             description = (f"SCELLÉ NUMERIQUE Bénéficiaire: Nom: {client_name}, "
                            f"Adresse: {address}, Coordonnées GPS: Latitude {lat}, Longitude {lng}")
-
-            log_area = st.empty()
-            api_upload_files(description, collages, session_id, log_area=log_area)
-
-        st.success(f"✅ {client_name} — {len(collages)} collage(s) envoyé(s).")
-        p_clients.progress(idx/len(groups))
-
-    st.balloons()
-    st.success("🎉 Batch terminé.")
+            api_upload_files(description, collages, session_id, log_write)
+        log_write(f"Finalisation terminée pour {client_name}.")
 
 # ========== UI ==========
 st.set_page_config(page_title="FIDEALIS — Dossier → R2 → Traitement auto", layout="centered")
-st.title("FIDEALIS — Dossier → R2 (auto) → Collages → Dépôt")
+st.title("FIDEALIS — Dossier → R2 → Collages → Dépôt")
 
 session_id = api_login()
 if not session_id:
@@ -271,42 +345,50 @@ credits = get_credit(session_id)
 if isinstance(credits, dict):
     st.caption(f"Crédit restant (Produit 4) : {get_quantity_for_product_4(credits)}")
 
-with st.expander("🧪 Diagnostic R2", expanded=False):
+with st.expander("Diagnostic R2", expanded=False):
     r2_health()
 
 with st.expander("Options de traitement"):
     max_dim = st.slider("Dimension max (px) avant collage", 800, 4000, 1600, step=100)
     jpeg_q  = st.slider("Qualité JPEG", 50, 95, 80, step=1)
+    inactivity_stop_s = st.slider("Arrêt auto du live s'il n'y a plus de nouvelles images (secondes)", 10, 300, 45, step=5)
+    poll_every_s = st.slider("Intervalle de polling R2 (secondes)", 0.5, 5.0, 2.0, step=0.5)
 
-# --- Query params (si tu veux garder le mode ?batch=...) ---
+# Zone de logs
+log_box = st.empty()
+def log_write(msg: str):
+    old = st.session_state.get("log_text", "")
+    new = old + (msg.strip() + "\n")
+    st.session_state["log_text"] = new
+    log_box.text(new if len(new) < 20000 else new[-20000:])  # limite d'affichage
+
+# --- Query params: support ?batch=... (optionnel) ---
 try:
     params = st.query_params
 except Exception:
     params = st.experimental_get_query_params()
 
 if "batch" in params:
-    batch_id_param = params["batch"] if isinstance(params["batch"], str) else params["batch"][0]
-    process_batch(batch_id_param, max_dim, jpeg_q, session_id)
-    st.stop()
+    st.session_state["last_batch_id"] = params["batch"] if isinstance(params["batch"], str) else params["batch"][0]
+    st.info(f"Batch détecté dans l'URL: {st.session_state['last_batch_id']}")
 
-# --- Ecran initial : upload -> R2 (PUT signé) ---
-st.markdown("### 1) Uploade un dossier complet → R2, puis traite-le")
+# --- Ecran initial: upload -> R2 (PUT signé) ---
+st.markdown("Étape 1. Uploader un dossier complet vers R2")
 
-if st.button("Sélectionner un dossier et Uploader vers R2", type="primary"):
+if st.button("Choisir le dossier et uploader vers R2", type="primary"):
     if not all([R2_ACCOUNT_ID, R2_BUCKET, R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY]):
-        st.error("R2 env manquantes (ACCOUNT_ID/BUCKET/ACCESS_KEY/SECRET).")
+        st.error("R2: variables d'environnement manquantes (ACCOUNT_ID/BUCKET/ACCESS_KEY/SECRET).")
         st.stop()
 
     batch_id = str(uuid.uuid4())
-    st.session_state["last_batch_id"] = batch_id  # 🔴 on mémorise côté serveur
+    st.session_state["last_batch_id"] = batch_id
     prefix = f"uploads/{batch_id}/"
 
-    # IFRAME: pas de redirection top-level (interdite). On affiche juste les logs d’upload.
     st.components.v1.html(f"""
 <!doctype html><html>
 <body>
 <input id="picker" type="file" webkitdirectory directory multiple style="display:none" />
-<button id="go" style="padding:10px 16px;font-size:16px;">Choisir le dossier…</button>
+<button id="go" style="padding:10px 16px;">Choisir le dossier…</button>
 <pre id="log" style="white-space:pre-wrap;border:1px solid #eee;padding:8px;border-radius:6px;max-height:280px;overflow:auto;margin-top:10px;"></pre>
 
 <script type="module">
@@ -318,7 +400,6 @@ const ACCOUNT_ID = {json.dumps(R2_ACCOUNT_ID)};
 const BUCKET = {json.dumps(R2_BUCKET)};
 const BUCKET_HOST = `${{BUCKET}}.${{ACCOUNT_ID}}.r2.cloudflarestorage.com`;
 const PREFIX = {json.dumps(prefix)};
-const BATCH_ID = {json.dumps(batch_id)};
 
 const client = new AwsClient({{
   accessKeyId: ACCESS_KEY_ID,
@@ -332,7 +413,7 @@ const pick = document.getElementById('picker');
 document.getElementById('go').addEventListener('click', ()=> pick.click());
 
 function normRelPath(rel) {{
-  return rel.replace(/^\\.\\//,'').replaceAll('\\\\','/'); // Windows → /
+  return rel.replace(/^\\.\\//,'').replaceAll('\\\\','/');
 }}
 function keyFor(rel) {{
   return PREFIX + normRelPath(rel);
@@ -350,44 +431,70 @@ pick.addEventListener('change', async () => {{
     .filter(x=> allowed.has(x.ext));
 
   if (!items.length) {{ log("Aucune image détectée dans le dossier."); return; }}
-  log(`Fichiers détectés: ${{items.length}} — upload en parallèle (PUT signé)…`);
+  log(`Fichiers détectés: ${{items.length}} — upload en parallèle (PUT signé).`);
 
-  const K = 8; // parallélisme
+  const K = 8;
   const queue = items.slice();
-  let ok=0, ko=0;
+  let ok=0, ko=0, tStart=performance.now();
 
   async function uploadOne(it) {{
     const url = `https://${{BUCKET_HOST}}/${{keyFor(it.rel)}}`;
-    const t0 = performance.now();
-    const res = await client.fetch(url, {{
-      method: "PUT",
-      body: it.file,
-      headers: {{ "Content-Type": it.file.type || "application/octet-stream" }}
-    }});
-    const dt = ((performance.now()-t0)/1000).toFixed(2);
-    if (!res.ok) throw new Error(`HTTP ${{res.status}}`);
-    ok++; if (ok % 10 === 0) log(`... ${{ok}}/${{items.length}} OK`);
+    try {{
+      const res = await client.fetch(url, {{
+        method: "PUT",
+        body: it.file,
+        headers: {{ "Content-Type": it.file.type || "application/octet-stream" }}
+      }});
+      if (!res.ok) throw new Error(`HTTP ${{res.status}}`);
+      ok++;
+      if ((ok+ko) % 10 === 0) {{
+        const pct = Math.round(((ok+ko)/items.length)*100);
+        log(`Progression: ${{ok+ko}}/${{items.length}} (${pct}%)`);
+      }}
+    }} catch (e) {{
+      ko++;
+      log("Echec: " + it.rel + " :: " + (e && e.message ? e.message : e));
+    }}
   }}
 
   async function worker() {{
     while (queue.length) {{
       const it = queue.shift();
-      try {{ await uploadOne(it); }}
-      catch(e) {{ ko++; log("FAIL "+it.rel+" :: "+(e && e.message?e.message:e)); }}
+      await uploadOne(it);
     }}
   }}
 
   await Promise.all(Array.from({{length:K}}, worker));
-  log(`Terminé — OK=${{ok}}, FAIL=${{ko}}`);
-  log("ℹ️ Revenez dans l’application et cliquez sur “Traiter ce batch maintenant”.");
+  const dt = ((performance.now()-tStart)/1000).toFixed(1);
+  log(`Terminé. OK=${{ok}}, FAIL=${{ko}}. Durée: ${{dt}}s`);
+  log("Reviens dans l'application et lance le traitement en direct ou la finalisation.");
 }});
 </script>
 </body></html>
 """, height=360)
 
-# Bouton manuel (fiable) pour lancer le traitement sans redirection
-last = st.session_state.get("last_batch_id")
-if last:
-    st.info(f"Batch prêt: **{last}**")
-    if st.button("✅ Traiter ce batch maintenant"):
-        process_batch(last, max_dim, jpeg_q, session_id)
+# Étape 2: traitement live (parallèle à l'upload)
+st.markdown("Étape 2. Traitement en direct pendant l'upload (tranches de 36 par client)")
+
+col1, col2 = st.columns(2)
+with col1:
+    if st.button("Démarrer le traitement en direct"):
+        batch_id = st.session_state.get("last_batch_id")
+        if not batch_id:
+            st.error("Aucun batch en mémoire. Lance d'abord l'upload.")
+        else:
+            log_write(f"Début du traitement en direct pour batch {batch_id}")
+            live_watch_and_process(batch_id, max_dim, jpeg_q, session_id,
+                                   inactivity_stop_s=inactivity_stop_s,
+                                   poll_every_s=poll_every_s,
+                                   log_write=log_write)
+
+with col2:
+    if st.button("Finaliser (envoyer le reliquat)"):
+        batch_id = st.session_state.get("last_batch_id")
+        if not batch_id:
+            st.error("Aucun batch en mémoire. Lance d'abord l'upload.")
+        else:
+            log_write(f"Finalisation du batch {batch_id}")
+            finalize_leftovers(batch_id, jpeg_q, session_id, log_write)
+            log_write("Finalisation terminée.")
