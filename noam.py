@@ -1,609 +1,406 @@
-# app.py
-import os, io, re, json, uuid, base64, time, tempfile, threading, shutil
-import requests, streamlit as st, boto3
-from typing import List, Tuple, Optional, Dict, Set
+import os
+import io
+import re
+import math
+import json
+import base64
+import requests
+import streamlit as st
+from typing import List, Tuple, Optional
 from PIL import Image, ImageOps, ImageFile
-import botocore.client
-from datetime import datetime
 
+# Pour éviter des erreurs sur images tronquées
 ImageFile.LOAD_TRUNCATED_IMAGES = True
 
-# ========= ENV (Fidealis) =========
-API_URL = os.getenv("API_URL")
+# =========================
+# Config via variables d'environnement
+# =========================
+API_URL = os.getenv("API_URL")                     # ex: https://api.fidealis.com/xxx
 API_KEY = os.getenv("API_KEY")
 ACCOUNT_KEY = os.getenv("ACCOUNT_KEY")
-GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
+GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")       # pour géocodage d'adresse (optionnel)
+# Service account : au CHOIX -> 1) JSON en clair via env, 2) chemin vers fichier .json
+GDRIVE_SA_JSON = os.getenv("GOOGLE_DRIVE_SERVICE_ACCOUNT_JSON")  # contenu JSON (string)
+GDRIVE_SA_FILE = os.getenv("GOOGLE_DRIVE_SERVICE_ACCOUNT_FILE")  # chemin d'un fichier .json
 
-# ========= ENV (Cloudflare R2) =========
-R2_ACCOUNT_ID = os.getenv("R2_ACCOUNT_ID")
-R2_BUCKET = os.getenv("R2_BUCKET")
-R2_ACCESS_KEY_ID = os.getenv("R2_ACCESS_KEY_ID")
-R2_SECRET_ACCESS_KEY = os.getenv("R2_SECRET_ACCESS_KEY")
-R2_REGION = os.getenv("R2_REGION", "auto")
+MAX_DIM = int(os.getenv("MAX_DIM", "1600"))        # redimensionnement max (px)
+JPEG_QUALITY = int(os.getenv("JPEG_QUALITY", "80"))
 
-# Navigateur (virtual-hosted) & SDK endpoint
-R2_BUCKET_HOST = f"{R2_BUCKET}.{R2_ACCOUNT_ID}.r2.cloudflarestorage.com"
-R2_ENDPOINT = f"https://{R2_ACCOUNT_ID}.r2.cloudflarestorage.com"
+# =========================
+# Google APIs (Drive)
+# =========================
+from google.oauth2 import service_account
+from googleapiclient.discovery import build
+from googleapiclient.http import MediaIoBaseDownload
 
-# ========= boto3 client =========
-s3 = boto3.client(
-    "s3",
-    region_name=R2_REGION,
-    endpoint_url=R2_ENDPOINT,
-    aws_access_key_id=R2_ACCESS_KEY_ID,
-    aws_secret_access_key=R2_SECRET_ACCESS_KEY,
-    config=botocore.client.Config(s3={"addressing_style": "virtual"})
-)
+def get_drive_service():
+    scopes = ['https://www.googleapis.com/auth/drive.readonly']
+    if GDRIVE_SA_JSON:
+        info = json.loads(GDRIVE_SA_JSON)
+        creds = service_account.Credentials.from_service_account_info(info, scopes=scopes)
+    elif GDRIVE_SA_FILE:
+        creds = service_account.Credentials.from_service_account_file(GDRIVE_SA_FILE, scopes=scopes)
+    else:
+        raise RuntimeError("Aucune crédential Google Drive fournie. Définis GOOGLE_DRIVE_SERVICE_ACCOUNT_JSON ou GOOGLE_DRIVE_SERVICE_ACCOUNT_FILE.")
+    # cache_discovery=False évite un warning
+    return build('drive', 'v3', credentials=creds, cache_discovery=False)
 
-# ========= Constantes =========
-IMG_EXTS = {".jpg",".jpeg",".png",".JPG",".JPEG",".PNG"}
-CLIENT_RE = re.compile(r"^\s*(.+?)\s*-\s*(.+?)\s*$")  # "ClientName - Address"
+def extract_folder_id(maybe_url: str) -> str:
+    m = re.search(r'/folders/([a-zA-Z0-9_-]+)', maybe_url)
+    if m:
+        return m.group(1)
+    if re.fullmatch(r'[a-zA-Z0-9_-]{20,}', maybe_url):
+        return maybe_url
+    raise ValueError("Impossible de détecter l'ID du dossier : fournis une URL Drive ou un ID.")
 
-# ----------------- util -----------------
-def now_str() -> str:
-    return datetime.now().strftime("%H:%M:%S")
+def list_subfolders(drive, parent_id: str) -> List[dict]:
+    """Liste les sous-dossiers directs du parent."""
+    q = f"'{parent_id}' in parents and trashed=false and mimeType='application/vnd.google-apps.folder'"
+    subfolders = []
+    page_token = None
+    while True:
+        resp = drive.files().list(
+            q=q,
+            spaces='drive',
+            fields="nextPageToken, files(id,name,parents)",
+            pageToken=page_token
+        ).execute()
+        subfolders.extend(resp.get('files', []))
+        page_token = resp.get('nextPageToken')
+        if not page_token:
+            break
+    return subfolders
 
-def safe_join(*parts: str) -> str:
-    p = os.path.join(*parts)
-    os.makedirs(os.path.dirname(p), exist_ok=True)
-    return p
+def list_images_in_folder(drive, folder_id: str) -> List[dict]:
+    """Liste les fichiers image (mimeType image/*) d'un dossier (pas récursif)."""
+    q = f"'{folder_id}' in parents and trashed=false and mimeType contains 'image/'"
+    images = []
+    page_token = None
+    while True:
+        resp = drive.files().list(
+            q=q,
+            spaces='drive',
+            fields="nextPageToken, files(id,name,mimeType,size,createdTime)",
+            pageToken=page_token
+        ).execute()
+        images.extend(resp.get('files', []))
+        page_token = resp.get('nextPageToken')
+        if not page_token:
+            break
+    # Petit tri par nom pour stabilité
+    images.sort(key=lambda f: f.get('name',''))
+    return images
 
-def slug(s: str) -> str:
-    return re.sub(r"[^a-zA-Z0-9._-]+", "_", s).strip("_")
+def download_image_bytes(drive, file_id: str) -> bytes:
+    """Télécharge un fichier Drive en mémoire (BytesIO) par streaming."""
+    request = drive.files().get_media(fileId=file_id)
+    fh = io.BytesIO()
+    downloader = MediaIoBaseDownload(fh, request)
+    done = False
+    while not done:
+        status, done = downloader.next_chunk()
+        # on pourrait afficher une barre de progression par fichier si besoin
+    return fh.getvalue()
 
-# ---------- Fidealis ----------
+# =========================
+# Google Maps Geocoding (optionnel)
+# =========================
+def get_coordinates(address: str) -> Tuple[Optional[str], Optional[str]]:
+    if not address or not GOOGLE_API_KEY:
+        return None, None
+    url = "https://maps.googleapis.com/maps/api/geocode/json"
+    try:
+        r = requests.get(url, params={"address": address, "key": GOOGLE_API_KEY}, timeout=30)
+        if r.status_code == 200:
+            data = r.json()
+            if data.get("status") == "OK" and data.get("results"):
+                loc = data["results"][0]["geometry"]["location"]
+                return str(loc["lat"]), str(loc["lng"])
+    except Exception:
+        pass
+    return None, None
+
+# =========================
+# Fidealis API
+# =========================
 def api_login() -> Optional[str]:
     try:
-        r = requests.get(API_URL, params={"key":API_KEY,"call":"loginUserFromAccountKey","accountKey":ACCOUNT_KEY}, timeout=30)
-        r.raise_for_status()
-        return r.json().get("PHPSESSID")
+        r = requests.get(
+            API_URL,
+            params={"key": API_KEY, "call": "loginUserFromAccountKey", "accountKey": ACCOUNT_KEY},
+            timeout=30,
+        )
+        data = r.json()
+        return data.get("PHPSESSID")
     except Exception:
         return None
 
-def api_upload_files(description: str, filepaths: List[str], session_id: str, log_cb):
-    total = len(filepaths)
-    if total == 0:
-        return
-    log_cb(f"{now_str()}  Fidealis: envoi de {total} fichier(s) (lots de 12)")
-    for start in range(0, total, 12):
-        batch = filepaths[start:start+12]
-        data = {
-            "key": API_KEY, "PHPSESSID": session_id, "call": "setDeposit",
-            "description": description, "type":"deposit","hidden":"0","sendmail":"1","background":"2"
-        }
-        for idx, fp in enumerate(batch, start=1):
-            with open(fp, "rb") as f:
-                data[f"file{idx}"] = base64.b64encode(f.read()).decode("utf-8")
-            data[f"filename{idx}"] = os.path.basename(fp)
-        try:
-            r = requests.post(API_URL, data=data, timeout=120)
-            try:
-                js = r.json()
-                log_cb(f"{now_str()}    Lot {start+1}-{start+len(batch)}: HTTP {r.status_code} — {js}")
-            except Exception:
-                log_cb(f"{now_str()}    Lot {start+1}-{start+len(batch)}: HTTP {r.status_code}")
-        except Exception as e:
-            log_cb(f"{now_str()}    Lot {start+1}-{start+len(batch)}: erreur requête: {e}")
-
 def get_credit(session_id: str):
     try:
-        r = requests.get(API_URL, params={"key":API_KEY,"PHPSESSID":session_id,"call":"getCredits","product_ID":""}, timeout=30)
-        if r.status_code==200: return r.json()
-    except Exception: pass
+        r = requests.get(
+            API_URL,
+            params={"key": API_KEY, "PHPSESSID": session_id, "call": "getCredits", "product_ID": ""},
+            timeout=30,
+        )
+        if r.status_code == 200:
+            return r.json()
+    except Exception:
+        pass
     return None
 
 def get_quantity_for_product_4(credit_data):
-    try: return credit_data["4"]["quantity"]
-    except Exception: return "N/A"
-
-# ---------- Geocoding ----------
-def get_coordinates(address: str) -> Tuple[Optional[float], Optional[float]]:
-    if not GOOGLE_API_KEY: return None, None
     try:
-        r = requests.get("https://maps.googleapis.com/maps/api/geocode/json",
-                         params={"address":address,"key":GOOGLE_API_KEY}, timeout=30)
-        r.raise_for_status()
-        data = r.json()
-        if data.get("status")=="OK" and data.get("results"):
-            loc = data["results"][0]["geometry"]["location"]
-            return loc["lat"], loc["lng"]
-    except Exception: pass
-    return None, None
+        return credit_data["4"]["quantity"]
+    except Exception:
+        return "N/A"
 
-# ---------- Images ----------
-def preprocess_to_jpeg_bytes(raw: bytes, max_dim=1600, quality=80) -> bytes:
-    with Image.open(io.BytesIO(raw)) as img:
+def encode_base64_bytes(b: bytes) -> str:
+    return base64.b64encode(b).decode("utf-8")
+
+# =========================
+# Préprocessing & Collage
+# =========================
+def load_preprocess_jpeg(img_bytes: bytes, max_dim: int = MAX_DIM, quality: int = JPEG_QUALITY) -> bytes:
+    """
+    Ouvre l'image, corrige orientation EXIF, convertit -> RGB, resize pour que max(w,h)<=max_dim,
+    renvoie des bytes JPEG compressés sans EXIF.
+    """
+    with Image.open(io.BytesIO(img_bytes)) as img:
         img = ImageOps.exif_transpose(img)
-        if img.mode not in ("RGB","L"): img = img.convert("RGB")
-        w,h = img.size
-        s = min(1.0, max_dim/max(w,h))
-        if s < 1.0:
-            img = img.resize((int(w*s), int(h*s)), Image.LANCZOS)
+        if img.mode not in ("RGB", "L"):
+            img = img.convert("RGB")
+        w, h = img.size
+        scale = min(1.0, max_dim / max(w, h))
+        if scale < 1.0:
+            img = img.resize((int(w*scale), int(h*scale)), Image.LANCZOS)
         out = io.BytesIO()
-        img.save(out, "JPEG", quality=quality, optimize=True)
+        img.save(out, format="JPEG", quality=quality, optimize=True)
         return out.getvalue()
 
-def create_collage(pil_images: List[Image.Image], out_path: str, quality=80):
-    min_h = min(i.size[1] for i in pil_images)
-    resized = [ImageOps.fit(i, (int(i.size[0]*min_h/i.size[1]), min_h)) for i in pil_images]
-    total_w = sum(i.size[0] for i in resized) + (len(resized)-1)*20 + 50
-    canvas = Image.new("RGB", (total_w, min_h+50), (255,255,255))
+def create_collage_from_three(jpegs: List[bytes]) -> bytes:
+    """
+    Crée un collage horizontal avec 1 à 3 images JPEG (déjà préprocessées).
+    Hauteur = min des hauteurs, marge interne légère.
+    """
+    images = [Image.open(io.BytesIO(b)) for b in jpegs]
+    # Harmoniser la hauteur (min)
+    min_h = min(im.height for im in images)
+    resized = []
+    for im in images:
+        scale = min_h / im.height
+        new_w = int(im.width * scale)
+        resized.append(im.resize((new_w, min_h), Image.LANCZOS))
+
+    # Canvas blanc avec padding 25px et 20px entre images
+    total_w = sum(im.width for im in resized) + (len(resized)-1)*20 + 50
+    canvas = Image.new("RGB", (total_w, min_h + 50), (255, 255, 255))
     x = 25
-    for i in resized:
-        canvas.paste(i, (x,25)); x += i.size[0] + 20
-    canvas.save(out_path, "JPEG", quality=quality, optimize=True)
-    canvas.close()
-    for i in pil_images: i.close()
+    for im in resized:
+        canvas.paste(im, (x, 25))
+        x += im.width + 20
 
-def create_collages_from_paths(img_paths: List[str], client_name: str, workdir: str, q=80) -> List[str]:
-    out = []
-    for i in range(0, len(img_paths), 3):
-        group = img_paths[i:i+3]
-        imgs = [Image.open(p) for p in group]
-        p = os.path.join(workdir, f"c_{client_name}_{len(out)+1}.jpg")
-        create_collage(imgs, p, quality=q)
-        out.append(p)
-    if out:
-        renamed = os.path.join(workdir, f"{client_name}_1.jpg")
-        os.replace(out[0], renamed)
-        out[0] = renamed
-    return out
+    out = io.BytesIO()
+    canvas.save(out, format="JPEG", quality=JPEG_QUALITY, optimize=True)
+    return out.getvalue()
 
-# ---------- R2 (serveur) ----------
-def list_objects(prefix: str) -> List[str]:
-    keys, token = [], None
-    while True:
-        kw={"Bucket":R2_BUCKET,"Prefix":prefix,"MaxKeys":1000}
-        if token: kw["ContinuationToken"]=token
-        resp = s3.list_objects_v2(**kw)
-        for obj in resp.get("Contents", []):
-            keys.append(obj["Key"])
-        if resp.get("IsTruncated"): token = resp.get("NextContinuationToken")
-        else: break
-    return keys
+def build_description(client_name: str, address: str, lat: Optional[str], lng: Optional[str]) -> str:
+    return (
+        f"SCELLÉ NUMERIQUE — Bénéficiaire: {client_name} — Adresse: {address} — "
+        f"Coordonnées GPS: Latitude {lat or ''}, Longitude {lng or ''}"
+    )
 
-def split_client(folder: str) -> Optional[Tuple[str,str]]:
-    m = CLIENT_RE.match(folder)
-    return (m.group(1).strip(), m.group(2).strip()) if m else None
+def upload_collages_to_fidealis(session_id: str, description: str, collages: List[Tuple[str, bytes]], progress_cb=None):
+    """
+    Envoie les collages par 'méga-batches' de 36 (pour RAM), et dans chaque méga-batch,
+    appelle l'API Fidealis par sous-batches de 12 (limite Fidealis).
+    collages: liste [(filename.jpg, bytes)]
+    """
+    sent = 0
+    for i in range(0, len(collages), 36):
+        mega = collages[i:i+36]
+        # sous-batches de 12 pour setDeposit
+        for j in range(0, len(mega), 12):
+            batch = mega[j:j+12]
+            data = {
+                "key": API_KEY,
+                "PHPSESSID": session_id,
+                "call": "setDeposit",
+                "description": description,
+                "type": "deposit",
+                "hidden": "0",
+                "sendmail": "1",
+                "background": "2",
+            }
+            for idx, (fname, jpeg_bytes) in enumerate(batch, start=1):
+                data[f"filename{idx}"] = fname
+                data[f"file{idx}"] = encode_base64_bytes(jpeg_bytes)
+            # POST
+            r = requests.post(API_URL, data=data, timeout=120)
+            # Option: vérifier r.status_code / r.json()
+            sent += len(batch)
+            if progress_cb:
+                progress_cb(sent, len(collages))
+    return sent
 
-def find_client_segment(path_rel: str) -> Optional[str]:
-    parts = path_rel.strip("/").split("/")
-    for seg in parts:
-        if CLIENT_RE.match(seg or ""):
-            return seg
-    return None
-
-def group_keys_by_client(keys: List[str], batch_prefix: str) -> Dict[str, List[str]]:
-    groups: Dict[str,List[str]] = {}
-    for k in keys:
-        if not k.startswith(batch_prefix) or k.endswith("/"):
-            continue
-        rel = k[len(batch_prefix):]
-        client_seg = find_client_segment(rel)
-        if client_seg:
-            groups.setdefault(client_seg, []).append(k)
-    for v in groups.values():
-        v.sort()
-    return groups
-
-# =========================================
-#        RUNTIME PARTAGÉ (thread-safe)
-# =========================================
-LOCK = threading.Lock()
-
-def make_runtime():
-    return {
-        "runner": {
-            "batch_id": None,
-            "running": False,
-            "ended": False,
-            "error": None,
-            "inactivity_s": 45.0,
-            "poll_s": 2.0,
-            "max_dim": 1600,
-            "jpeg_q": 80,
-            "root_tmp": None,
-            "started_ts": None,
-            "last_activity": None,
-        },
-        # clients[client_folder] = {
-        #   name,address,lat,lng, seen_keys:set, normalized_count:int,
-        #   buffer_paths:[], files_sent:int, collages_sent:int, api_calls:int,
-        #   status:str, last_event:str, r2_seen_count:int
-        # }
-        "clients": {},
-        "logs": []
-    }
-
-def rt_log(rt, msg: str):
-    with LOCK:
-        rt["logs"].append(msg)
-        if len(rt["logs"]) > 1200:
-            rt["logs"] = rt["logs"][-1200:]
-
-def rt_ensure_client(rt, client_folder, name, address):
-    with LOCK:
-        if client_folder in rt["clients"]:
-            return
-        lat, lng = get_coordinates(address)
-        if lat is None or lng is None:
-            lat, lng = ("N/A","N/A")
-        rt["clients"][client_folder] = {
-            "name": name, "address": address, "lat": lat, "lng": lng,
-            "seen_keys": set(),
-            "normalized_count": 0,
-            "buffer_paths": [],
-            "files_sent": 0,
-            "collages_sent": 0,
-            "api_calls": 0,
-            "status": "en attente",
-            "last_event": now_str(),
-            "r2_seen_count": 0
-        }
-
-def client_root_dir(root_tmp: str, client_folder: str) -> str:
-    return os.path.join(root_tmp, slug(client_folder))
-
-# ============ THREAD DE TRAITEMENT ============
-def processor_thread(rt: dict, fidealis_session: str):
-    runner = rt["runner"]
-    batch_id = runner["batch_id"]
-    batch_prefix = f"uploads/{batch_id}/"
-    root_tmp = runner["root_tmp"]
-    inactivity_s = float(runner["inactivity_s"])
-    poll_s = float(runner["poll_s"])
-    max_dim = int(runner["max_dim"])
-    jpeg_q = int(runner["jpeg_q"])
-
-    rt_log(rt, f"{now_str()}  Démarrage traitement batch {batch_id}")
-    with LOCK:
-        runner["running"] = True
-        runner["ended"] = False
-        runner["error"] = None
-        runner["started_ts"] = now_str()
-        runner["last_activity"] = time.time()
-
-    try:
-        while True:
-            keys = list_objects(batch_prefix)
-            groups = group_keys_by_client(keys, batch_prefix)
-            updated = False
-
-            # Enregistrer le nombre d'objets du côté R2 (upload détecté)
-            for client_folder, client_keys in groups.items():
-                parsed = split_client(client_folder)
-                if not parsed:
-                    continue
-                client_name, address = parsed
-                rt_ensure_client(rt, client_folder, client_name, address)
-                with LOCK:
-                    c = rt["clients"][client_folder]
-                    c["r2_seen_count"] = len(client_keys)
-                    c["status"] = "traitement"
-                    c["last_event"] = now_str()
-
-            # Normaliser et pousser par blocs de 36
-            for client_folder, client_keys in groups.items():
-                parsed = split_client(client_folder)
-                if not parsed:
-                    continue
-                client_name, address = parsed
-
-                with LOCK:
-                    c = rt["clients"][client_folder]
-                    seen = set(c["seen_keys"])
-                new_keys = [k for k in client_keys if k not in seen]
-                if not new_keys:
-                    continue
-
-                updated = True
-                cdir = client_root_dir(root_tmp, client_folder)
-                os.makedirs(cdir, exist_ok=True)
-
-                # Normalisation
-                for key in new_keys:
-                    try:
-                        b = io.BytesIO()
-                        s3.download_fileobj(R2_BUCKET, key, b)
-                        jb = preprocess_to_jpeg_bytes(b.getvalue(), max_dim=max_dim, quality=jpeg_q)
-                        outp = safe_join(cdir, f"{uuid.uuid4().hex}.jpg")
-                        with open(outp, "wb") as o: o.write(jb)
-                        with LOCK:
-                            c_ref = rt["clients"][client_folder]
-                            c_ref["buffer_paths"].append(outp)
-                            c_ref["normalized_count"] += 1
-                            c_ref["seen_keys"].add(key)
-                    except Exception as e:
-                        rt_log(rt, f"{now_str()}  Normalisation échec {key}: {e}")
-
-                # Blocs de 36
-                while True:
-                    with LOCK:
-                        buf = rt["clients"][client_folder]["buffer_paths"]
-                        if len(buf) < 36:
-                            break
-                        block = buf[:36]
-                        del buf[:36]
-                        name = rt["clients"][client_folder]["name"]
-                        addr = rt["clients"][client_folder]["address"]
-                        lat = rt["clients"][client_folder]["lat"]
-                        lng = rt["clients"][client_folder]["lng"]
-
-                    tmp_send = safe_join(root_tmp, f"send_{uuid.uuid4().hex}", "")
-                    os.makedirs(tmp_send, exist_ok=True)
-                    collages = create_collages_from_paths(block, name, tmp_send, q=jpeg_q)
-                    description = (f"SCELLÉ NUMERIQUE Bénéficiaire: Nom: {name}, "
-                                   f"Adresse: {addr}, Coordonnées GPS: Latitude {lat}, Longitude {lng}")
-                    api_upload_files(description, collages, fidealis_session, lambda m: rt_log(rt, m))
-                    with LOCK:
-                        rt["clients"][client_folder]["files_sent"] += len(block)
-                        rt["clients"][client_folder]["collages_sent"] += len(collages)
-                        rt["clients"][client_folder]["api_calls"] += max(1, (len(collages)+11)//12)
-                        rt["clients"][client_folder]["last_event"] = now_str()
-                    try:
-                        shutil.rmtree(tmp_send, ignore_errors=True)
-                    except Exception:
-                        pass
-                    rt_log(rt, f"{now_str()}  {name}: bloc de 36 images envoyé à Fidealis")
-
-            if updated:
-                with LOCK:
-                    runner["last_activity"] = time.time()
-
-            # Fin si inactif
-            with LOCK:
-                inactive = (time.time() - runner["last_activity"]) > inactivity_s
-            if inactive:
-                rt_log(rt, f"{now_str()}  Inactivité {int(inactivity_s)}s: finalisation des reliquats (<36)")
-                for client_folder, c in list(rt["clients"].items()):
-                    with LOCK:
-                        buf = list(c["buffer_paths"])
-                        name, addr, lat, lng = c["name"], c["address"], c["lat"], c["lng"]
-                        rt["clients"][client_folder]["buffer_paths"].clear()
-                    if not buf:
-                        with LOCK:
-                            rt["clients"][client_folder]["status"] = "terminé"
-                            rt["clients"][client_folder]["last_event"] = now_str()
-                        continue
-                    tmp_send = safe_join(root_tmp, f"send_{uuid.uuid4().hex}", "")
-                    os.makedirs(tmp_send, exist_ok=True)
-                    collages = create_collages_from_paths(buf, name, tmp_send, q=jpeg_q)
-                    description = (f"SCELLÉ NUMERIQUE Bénéficiaire: Nom: {name}, "
-                                   f"Adresse: {addr}, Coordonnées GPS: Latitude {lat}, Longitude {lng}")
-                    api_upload_files(description, collages, fidealis_session, lambda m: rt_log(rt, m))
-                    with LOCK:
-                        rt["clients"][client_folder]["files_sent"] += len(buf)
-                        rt["clients"][client_folder]["collages_sent"] += len(collages)
-                        if collages:
-                            rt["clients"][client_folder]["api_calls"] += max(1, (len(collages)+11)//12)
-                        rt["clients"][client_folder]["status"] = "terminé"
-                        rt["clients"][client_folder]["last_event"] = now_str()
-                    try:
-                        shutil.rmtree(tmp_send, ignore_errors=True)
-                    except Exception:
-                        pass
-                break
-
-            time.sleep(poll_s)
-
-    except Exception as e:
-        rt_log(rt, f"{now_str()}  Erreur fatale: {e}")
-        with LOCK:
-            runner["error"] = str(e)
-    finally:
-        with LOCK:
-            runner["running"] = False
-            runner["ended"] = True
-        rt_log(rt, f"{now_str()}  Traitement terminé")
-        try:
-            shutil.rmtree(root_tmp, ignore_errors=True)
-        except Exception:
-            pass
-
-# ========== UI ==========
-st.set_page_config(page_title="FIDEALIS — Dossier → R2 → Traitement automatique", layout="wide")
-st.title("FIDEALIS — Dossier → R2 → Collages → Dépôt (automatique)")
-
-# runtime dans session_state (le thread n’y touche jamais)
-if "runtime" not in st.session_state:
-    st.session_state.runtime = make_runtime()
-rt = st.session_state.runtime  # alias
+# =========================
+# Streamlit UI
+# =========================
+st.title("FIDEALIS — Drive → Collages → Upload (Batch 36 / 12)")
 
 # Connexion Fidealis
 session_id = api_login()
 if not session_id:
-    st.error("Connexion Fidealis échouée (API_URL/API_KEY/ACCOUNT_KEY).")
+    st.error("Échec de la connexion à Fidealis (PHPSESSID manquant). Vérifie API_URL/API_KEY/ACCOUNT_KEY.")
     st.stop()
-st.session_state["fidealis_session_id"] = session_id
 
-credits = get_credit(session_id)
-if isinstance(credits, dict):
-    st.caption(f"Crédit restant (Produit 4) : {get_quantity_for_product_4(credits)}")
+credit_data = get_credit(session_id)
+if isinstance(credit_data, dict):
+    st.write(f"Crédit restant (Produit 4) : {get_quantity_for_product_4(credit_data)}")
 
-# Diagnostic simple
-with st.expander("Diagnostic R2 (serveur)"):
+root_input = st.text_input("URL ou ID du dossier Drive racine (contenant les sous-dossiers `Client - Adresse`)")
+
+max_dim = st.slider("Dimension max (px)", 800, 4000, MAX_DIM, step=100)
+jpeg_quality = st.slider("Qualité JPEG", 50, 95, JPEG_QUALITY, step=1)
+
+if st.button("Lancer le traitement"):
     try:
-        s3.head_bucket(Bucket=R2_BUCKET)
-        st.success("head_bucket OK")
+        root_id = extract_folder_id(root_input)
     except Exception as e:
-        st.error(f"head_bucket: {e}")
-
-# Options
-with st.expander("Options de traitement"):
-    with LOCK:
-        rt["runner"]["max_dim"] = st.slider("Dimension max (px) avant collage", 800, 4000, rt["runner"]["max_dim"], step=100)
-        rt["runner"]["jpeg_q"]  = st.slider("Qualité JPEG", 50, 95, rt["runner"]["jpeg_q"], step=1)
-        rt["runner"]["inactivity_s"] = st.slider("Arrêt auto si plus de nouvelles images (s)", 10, 300, int(rt["runner"]["inactivity_s"]), step=5)
-        rt["runner"]["poll_s"] = st.slider("Intervalle de polling R2 (s)", 0.5, 5.0, float(rt["runner"]["poll_s"]), step=0.5)
-
-# Déclenchement global
-colA, colB = st.columns([1,2])
-with colA:
-    start_clicked = st.button("Choisir un dossier et tout lancer", type="primary")
-with colB:
-    st.write("Après la sélection, l’upload vers R2 démarre et le traitement s’exécute en parallèle. Le suivi s’actualise automatiquement.")
-
-if start_clicked:
-    if not all([R2_ACCOUNT_ID, R2_BUCKET, R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY]):
-        st.error("R2: variables d’environnement manquantes (ACCOUNT_ID/BUCKET/ACCESS_KEY/SECRET).")
+        st.error(f"ID/URL de dossier invalide : {e}")
         st.stop()
 
-    # reset runtime
-    with LOCK:
-        st.session_state.runtime = make_runtime()
-        rt = st.session_state.runtime
-        rt["runner"]["batch_id"] = str(uuid.uuid4())
-        rt["runner"]["root_tmp"] = os.path.join("/tmp", f"batch_{rt['runner']['batch_id']}")
-        os.makedirs(rt["runner"]["root_tmp"], exist_ok=True)
+    # Instancier Drive
+    try:
+        drive = get_drive_service()
+    except Exception as e:
+        st.error(f"Impossible d'initialiser l'API Google Drive : {e}")
+        st.stop()
 
-    prefix = f"uploads/{rt['runner']['batch_id']}/"
-    st.subheader("Upload vers R2 (navigateur) — progression locale")
-    # IMPORTANT: pas de '$' avant {{...}} ; encodeURIComponent côté JS
-    st.components.v1.html(f"""
-<!doctype html><html>
-<body>
-<input id="picker" type="file" webkitdirectory directory multiple style="display:none" />
-<button id="go" style="padding:10px 16px;">Choisir le dossier…</button>
-<pre id="log" style="white-space:pre-wrap;border:1px solid #ccc;padding:8px;border-radius:6px;max-height:300px;overflow:auto;margin-top:10px;"></pre>
+    # Lister sous-dossiers "Client - Adresse"
+    subfolders = list_subfolders(drive, root_id)
+    if not subfolders:
+        st.warning("Aucun sous-dossier trouvé sous ce dossier racine.")
+        st.stop()
 
-<script type="module">
-import {{ AwsClient }} from "https://esm.sh/aws4fetch@1.0.17";
+    st.info(f"{len(subfolders)} sous-dossiers détectés.")
 
-const ACCESS_KEY_ID = {json.dumps(R2_ACCESS_KEY_ID)};
-const SECRET_ACCESS_KEY = {json.dumps(R2_SECRET_ACCESS_KEY)};
-const ACCOUNT_ID = {json.dumps(R2_ACCOUNT_ID)};
-const BUCKET = {json.dumps(R2_BUCKET)};
-const BUCKET_HOST = `${{BUCKET}}.${{ACCOUNT_ID}}.r2.cloudflarestorage.com`;
-const PREFIX = {json.dumps(prefix)};
+    # Compteurs globaux
+    total_images_global = 0
+    total_collages_global = 0
+    total_collages_sent_global = 0
 
-const client = new AwsClient({{
-  accessKeyId: ACCESS_KEY_ID,
-  secretAccessKey: SECRET_ACCESS_KEY,
-  service: "s3",
-  region: "auto"
-}});
+    # Pour l’affichage temps réel
+    overall_photos_progress = st.progress(0.0, text="Photos traitées (global)")
+    overall_api_progress = st.progress(0.0, text="Collages envoyés à l'API (global)")
+    overall_status = st.empty()
 
-const log = (m)=>document.getElementById('log').textContent += m + "\\n";
-const pick = document.getElementById('picker');
-document.getElementById('go').addEventListener('click', ()=> pick.click());
+    # Parcours de chaque sous-dossier
+    for sf_idx, folder in enumerate(subfolders, start=1):
+        folder_name = folder["name"]
+        folder_id = folder["id"]
 
-function normRelPath(rel) {{
-  return rel.replace(/^\\.\\//,'').replaceAll('\\\\','/');
-}}
-function keyFor(rel) {{
-  return PREFIX + normRelPath(rel);
-}}
+        # Parse "Client - Adresse"
+        m = re.match(r'^\s*(.+?)\s*-\s*(.+)\s*$', folder_name)
+        client_name = m.group(1) if m else folder_name
+        address = m.group(2) if m else ""
 
-pick.addEventListener('change', async () => {{
-  const files = Array.from(pick.files||[]);
-  if (!files.length) {{ log("Aucun fichier sélectionné."); return; }}
+        # Géocodage (optionnel)
+        lat, lng = get_coordinates(address) if address else (None, None)
+        description = build_description(client_name, address, lat, lng)
 
-  const allowed = new Set([".jpg",".jpeg",".png",".JPG",".JPEG",".PNG"]);
-  const items = files
-    .map(f=>{{ const rel=f.webkitRelativePath||f.name;
-               const ext=rel.slice(rel.lastIndexOf('.'));
-               return {{file:f, rel, ext}}; }})
-    .filter(x=> allowed.has(x.ext));
+        st.subheader(f"Dossier {sf_idx}/{len(subfolders)} — {folder_name}")
+        images = list_images_in_folder(drive, folder_id)
+        total_images = len(images)
+        if total_images == 0:
+            st.write("Aucune image. On passe.")
+            continue
 
-  if (!items.length) {{ log("Aucune image détectée dans le dossier."); return; }}
-  log(`Fichiers détectés: ${{items.length}} — upload en parallèle (PUT signé).`);
+        total_images_global += total_images
+        # Nombre de collages = ceil(n/3)
+        collages_expected = math.ceil(total_images / 3)
+        total_collages_global += collages_expected
 
-  const K = 8;
-  const queue = items.slice();
-  let ok=0, ko=0, tStart=performance.now();
+        # UI par dossier
+        photos_bar = st.progress(0.0, text=f"Photos traitées : 0 / {total_images}")
+        api_bar = st.progress(0.0, text=f"Collages envoyés : 0 / {collages_expected}")
+        status = st.empty()
 
-  async function uploadOne(it) {{
-    const key = keyFor(it.rel);
-    const url = `https://{R2_BUCKET_HOST}/` + encodeURI(key);
-    try {{
-      const res = await client.fetch(url, {{
-        method: "PUT",
-        body: it.file,
-        headers: {{ "Content-Type": it.file.type || "application/octet-stream" }}
-      }});
-      if (!res.ok) throw new Error(`HTTP ${{res.status}}`);
-      ok++;
-      if ((ok+ko) % 10 === 0) {{
-        const pct = Math.round(((ok+ko)/items.length)*100);
-        log(`Upload: ${{ok+ko}}/${{items.length}} ({{pct}}%)`);
-      }}
-    }} catch (e) {{
-      ko++;
-      log("Echec upload: " + it.rel + " :: " + (e && e.message ? e.message : e));
-    }}
-  }}
+        # Pipeline : on travaille par groupe de 3 images -> produit 1 collage
+        collages_buffer: List[Tuple[str, bytes]] = []
+        photos_done = 0
+        collages_done = 0
 
-  async function worker() {{
-    while (queue.length) {{
-      const it = queue.shift();
-      await uploadOne(it);
-    }}
-  }}
+        def update_global_bars():
+            # met à jour barres globales
+            done_photos_ratio = photos_global_done / max(total_images_global, 1)
+            done_collages_ratio = (total_collages_sent_global) / max(total_collages_global, 1)
+            overall_photos_progress.progress(done_photos_ratio, text=f"Photos traitées (global) : {photos_global_done} / {total_images_global}")
+            overall_api_progress.progress(done_collages_ratio, text=f"Collages envoyés (global) : {total_collages_sent_global} / {total_collages_global}")
 
-  await Promise.all(Array.from({{length:K}}, worker));
-  const dt = ((performance.now()-tStart)/1000).toFixed(1);
-  log(`Upload terminé. OK=${{ok}}, FAIL=${{ko}}. Durée: ${{dt}}s`);
-}});
-</script>
-</body></html>
-""", height=360)
+        # On calcule au fur et à mesure
+        photos_global_done = 0  # pour ce dossier, on l’ajoutera au global au fil de l’eau
 
-    # démarrer le thread serveur
-    t = threading.Thread(target=processor_thread, args=(rt, session_id), daemon=True)
-    t.start()
+        # Télécharger → préprocess → composer collages → upload par 36 → soumettre par 12
+        # On évite d'accumuler trop en RAM : on fait un cycle "3 img -> 1 collage" puis on flush par paquets de 36
+        for i in range(0, total_images, 3):
+            group = images[i:i+3]
 
-# Tableau de suivi par client
-runner = rt["runner"]
-clients = rt["clients"]
+            # Télécharge et préprocess chaque image du groupe
+            group_jpegs = []
+            for f in group:
+                try:
+                    raw = download_image_bytes(drive, f["id"])
+                    jp = load_preprocess_jpeg(raw, max_dim=max_dim, quality=jpeg_quality)
+                    group_jpegs.append(jp)
+                except Exception as e:
+                    st.warning(f"Image sautée ({f.get('name','?')}): {e}")
 
-st.subheader("Suivi traitement (par client)")
-if clients:
-    import pandas as pd
-    rows = []
-    with LOCK:
-        for cf, c in clients.items():
-            rows.append({
-                "Client": c["name"],
-                "Adresse": c["address"],
-                "Upload détecté (R2)": c["r2_seen_count"],
-                "Normalisés": c["normalized_count"],
-                "En attente (non envoyés)": len(c["buffer_paths"]),
-                "Images envoyées API": c["files_sent"],
-                "Collages envoyés": c["collages_sent"],
-                "Appels Fidealis": c["api_calls"],
-                "Statut": c["status"],
-                "Dernier évènement": c["last_event"],
-            })
-    df = pd.DataFrame(rows)
-    st.dataframe(df, use_container_width=True, hide_index=True)
+            # Si rien dans le groupe, continue
+            if not group_jpegs:
+                photos_done += len(group)  # on considère traitées (skippées)
+                photos_global_done += len(group)
+                photos_bar.progress(min(1.0, photos_done / total_images), text=f"Photos traitées : {photos_done} / {total_images}")
+                update_global_bars()
+                continue
 
-    # Barres de progression claires
-    for cf, c in clients.items():
-        st.write(f"{c['name']} — Upload vers R2")
-        # On ne connaît pas le total exact à l'avance, donc on illustre la progression relative
-        # par le ratio normalisés / upload détecté pour voir si le serveur suit le rythme
-        uploaded = max(1, c["r2_seen_count"])
-        normalized = min(c["normalized_count"], uploaded)
-        st.progress(normalized/uploaded)
+            # Collage 1..3 images
+            try:
+                collage_bytes = create_collage_from_three(group_jpegs)
+                collage_idx = collages_done + 1
+                collage_name = f"c_{client_name}_{collage_idx:05d}.jpg"
+                collages_buffer.append((collage_name, collage_bytes))
+                collages_done += 1
+            except Exception as e:
+                st.error(f"Erreur collage groupe {i//3+1}: {e}")
 
-        st.write(f"{c['name']} — Envoi vers Fidealis")
-        sent = c["files_sent"]
-        # estimation: progress API = sent / uploaded (borne à 1)
-        st.progress(min(1.0, sent / max(1, uploaded)))
-else:
-    st.info("Aucun client détecté pour l’instant. Dès que l’upload commence, les clients apparaîtront ici.")
+            # Mise à jour des compteurs "photos"
+            photos_done += len(group)
+            photos_global_done += len(group)
+            photos_bar.progress(min(1.0, photos_done / total_images), text=f"Photos traitées : {photos_done} / {total_images}")
 
-# Journal
-st.subheader("Journal serveur (dernières lignes)")
-with LOCK:
-    st.text("\n".join(rt["logs"][-400:]))
+            # Dès qu’on a 36 collages en tampon, on envoie ce “méga-batch”
+            if len(collages_buffer) >= 36 or (i + 3) >= total_images:
+                # Progress callback pour ce dossier
+                sent_before = collages_done - len(collages_buffer)
+                def cb(sent_now, total_in_this_flush):
+                    # sent_now est cumulatif dans ce flush. On mappe sur la progression du dossier.
+                    sent_total = sent_before + sent_now
+                    api_bar.progress(min(1.0, sent_total / collages_expected), text=f"Collages envoyés : {min(sent_total, collages_expected)} / {collages_expected}")
 
-# Rafraîchissement automatique tant que ça tourne
-if runner["running"] and not runner["ended"]:
-    time.sleep(1.0)
-    st.rerun()
-else:
-    if runner["error"]:
-        st.error(f"Terminé avec erreur: {runner['error']}")
-    elif runner["ended"]:
-        st.success("Traitement terminé.")
+                try:
+                    upload_collages_to_fidealis(session_id, description, collages_buffer, progress_cb=lambda s,t: cb(s, t))
+                    total_collages_sent_global += len(collages_buffer)
+                except Exception as e:
+                    st.error(f"Erreur d’envoi Fidealis (méga-batch) : {e}")
+                    # on vide quand même pour continuer avec le reste
+                finally:
+                    collages_buffer.clear()
+                    # Mise à jour globale
+                    update_global_bars()
+
+        # Fin du sous-dossier
+        api_bar.progress(1.0, text=f"Collages envoyés : {collages_done} / {collages_expected}")
+        status.success(f"✅ Dossier terminé — {collages_done} collages envoyés (à partir de {photos_done} photos).")
+        overall_status.info(f"Avancement global — {total_collages_sent_global} collages envoyés / {total_collages_global} attendus.")
+
+    st.success("🎉 Traitement terminé pour tous les dossiers détectés.")
