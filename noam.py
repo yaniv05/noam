@@ -4,6 +4,7 @@ import re
 import math
 import json
 import base64
+import urllib.parse
 import requests
 import streamlit as st
 from typing import List, Tuple, Optional
@@ -19,30 +20,42 @@ API_URL = os.getenv("API_URL")                     # ex: https://api.fidealis.co
 API_KEY = os.getenv("API_KEY")
 ACCOUNT_KEY = os.getenv("ACCOUNT_KEY")
 
-# Géocodage Google Maps (optionnel, inchangé)
+# Géocodage Google Maps (optionnel)
 GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
 
 # *** Clé Google Drive pour accès public ***
-GOOGLE_DRIVE_API_KEY = os.getenv("GOOGLE_DRIVE_API_KEY")   # <-- NOUVELLE VAR D'ENV OBLIGATOIRE (public-only)
+GOOGLE_DRIVE_API_KEY = os.getenv("GOOGLE_DRIVE_API_KEY")   # PUBLIC ONLY
 
 MAX_DIM = int(os.getenv("MAX_DIM", "1600"))        # redimensionnement max (px)
 JPEG_QUALITY = int(os.getenv("JPEG_QUALITY", "80"))
 
 # =========================
-# Google Drive (PUBLIC-ONLY via API key)
+# Google Drive (PUBLIC-ONLY via API key) — resourceKey aware
 # =========================
-def extract_folder_id(maybe_url: str) -> str:
-    m = re.search(r'/folders/([a-zA-Z0-9_-]+)', maybe_url)
+def extract_folder_id_and_rk(maybe_url: str) -> Tuple[str, Optional[str]]:
+    """
+    Retourne (folder_id, resource_key_ou_None) à partir d'une URL Drive ou d'un ID.
+    Gère les URLs contenant ?resourcekey=...
+    """
+    # Cas URL /folders/<ID>?resourcekey=...
+    m = re.search(r'/folders/([a-zA-Z0-9_-]+)', maybe_url or "")
     if m:
-        return m.group(1)
-    if re.fullmatch(r'[a-zA-Z0-9_-]{20,}', maybe_url):
-        return maybe_url
+        folder_id = m.group(1)
+        parsed = urllib.parse.urlparse(maybe_url)
+        q = urllib.parse.parse_qs(parsed.query or "")
+        rk = (q.get("resourcekey") or q.get("resourceKey") or [None])[0]
+        return folder_id, rk
+
+    # Cas ID direct
+    if maybe_url and re.fullmatch(r'[a-zA-Z0-9_-]{20,}', maybe_url):
+        return maybe_url, None
+
     raise ValueError("Impossible de détecter l'ID du dossier : fournis une URL Drive ou un ID.")
 
-def _drive_list_children_public(parent_id: str, q_extra: Optional[str] = None) -> List[dict]:
+def _drive_list_children_public(parent_id: str, parent_rk: Optional[str], q_extra: Optional[str] = None) -> List[dict]:
     """
-    Liste les éléments d'un dossier PUBLIC (Anyone with the link) via API Key.
-    q_extra: filtre additionnel, ex. "and mimeType='application/vnd.google-apps.folder'"
+    Liste les éléments d'un dossier PUBLIC (Anyone with link).
+    Ajoute resourceKey dans les champs retournés.
     """
     if not GOOGLE_DRIVE_API_KEY:
         raise RuntimeError("GOOGLE_DRIVE_API_KEY manquant dans l'environnement.")
@@ -54,12 +67,14 @@ def _drive_list_children_public(parent_id: str, q_extra: Optional[str] = None) -
 
     params = {
         "q": q,
-        "fields": "nextPageToken, files(id,name,mimeType,size,createdTime,parents)",
+        "fields": "nextPageToken, files(id,name,mimeType,size,createdTime,parents,resourceKey)",
         "key": GOOGLE_DRIVE_API_KEY,
         "pageSize": 1000,
-        "supportsAllDrives": "false",
-        "includeItemsFromAllDrives": "false",
+        "supportsAllDrives": "true",
+        "includeItemsFromAllDrives": "true",
     }
+    if parent_rk:
+        params["resourceKey"] = parent_rk
 
     files = []
     while True:
@@ -73,33 +88,59 @@ def _drive_list_children_public(parent_id: str, q_extra: Optional[str] = None) -
         params["pageToken"] = token
     return files
 
-def list_subfolders_public(parent_id: str) -> List[dict]:
+def list_subfolders_public(parent_id: str, parent_rk: Optional[str]) -> List[dict]:
     return _drive_list_children_public(
         parent_id,
+        parent_rk,
         q_extra="and mimeType='application/vnd.google-apps.folder'"
     )
 
-def list_images_public(parent_id: str) -> List[dict]:
+def list_images_public(parent_id: str, parent_rk: Optional[str]) -> List[dict]:
     files = _drive_list_children_public(
         parent_id,
+        parent_rk,
         q_extra="and mimeType contains 'image/'"
     )
-    # Tri par nom pour stabilité
     files.sort(key=lambda f: f.get('name', ''))
     return files
 
-def download_file_public(file_id: str) -> bytes:
+def download_file_public(file_id: str, file_resource_key: Optional[str]) -> bytes:
     """
-    Télécharge le contenu d'un fichier PUBLIC (ou 'Anyone with link').
+    Télécharge un fichier PUBLIC.
+    1) Drive API alt=media (+ resourceKey + supportsAllDrives + acknowledgeAbuse)
+    2) Fallback URL publique uc?export=download&id=...&resourcekey=...
     """
     if not GOOGLE_DRIVE_API_KEY:
         raise RuntimeError("GOOGLE_DRIVE_API_KEY manquant dans l'environnement.")
 
+    # Essai 1 : API Drive alt=media
     url = f"https://www.googleapis.com/drive/v3/files/{file_id}"
-    params = {"alt": "media", "key": GOOGLE_DRIVE_API_KEY}
+    params = {
+        "alt": "media",
+        "key": GOOGLE_DRIVE_API_KEY,
+        "supportsAllDrives": "true",
+        "acknowledgeAbuse": "true",
+    }
+    if file_resource_key:
+        params["resourceKey"] = file_resource_key
+
     r = requests.get(url, params=params, timeout=120)
-    r.raise_for_status()
-    return r.content
+    if r.status_code == 200:
+        return r.content
+
+    # Essai 2 : URL publique uc
+    uc_params = {"export": "download", "id": file_id}
+    if file_resource_key:
+        uc_params["resourcekey"] = file_resource_key
+
+    r2 = requests.get("https://drive.google.com/uc", params=uc_params, timeout=120)
+    if r2.status_code == 200 and r2.content:
+        return r2.content
+
+    msg = f"Public download forbidden for file {file_id} (HTTP {r.status_code})."
+    if r.text:
+        msg += f" Detail: {r.text[:200]}"
+    raise requests.HTTPError(msg)
 
 # =========================
 # Google Maps Geocoding (optionnel)
@@ -263,14 +304,14 @@ jpeg_quality = st.slider("Qualité JPEG", 50, 95, JPEG_QUALITY, step=1)
 
 if st.button("Lancer le traitement"):
     try:
-        root_id = extract_folder_id(root_input)
+        root_id, root_rk = extract_folder_id_and_rk(root_input)
     except Exception as e:
         st.error(f"ID/URL de dossier invalide : {e}")
         st.stop()
 
     # Lister sous-dossiers "Client - Adresse" (public only)
     try:
-        subfolders = list_subfolders_public(root_id)
+        subfolders = list_subfolders_public(root_id, root_rk)
     except Exception as e:
         st.error(f"Erreur liste sous-dossiers (public): {e}")
         st.stop()
@@ -295,6 +336,7 @@ if st.button("Lancer le traitement"):
     for sf_idx, folder in enumerate(subfolders, start=1):
         folder_name = folder["name"]
         folder_id = folder["id"]
+        folder_rk  = folder.get("resourceKey")  # clé du sous-dossier (peut être None)
 
         # Parse "Client - Adresse"
         m = re.match(r'^\s*(.+?)\s*-\s*(.+)\s*$', folder_name)
@@ -308,7 +350,7 @@ if st.button("Lancer le traitement"):
         st.subheader(f"Dossier {sf_idx}/{len(subfolders)} — {folder_name}")
 
         try:
-            images = list_images_public(folder_id)
+            images = list_images_public(folder_id, folder_rk)
         except Exception as e:
             st.warning(f"Impossible de lister les images (public) pour {folder_name} : {e}")
             continue
@@ -330,14 +372,13 @@ if st.button("Lancer le traitement"):
         collages_buffer: List[Tuple[str, bytes]] = []
         photos_done = 0
         collages_done = 0
+        photos_global_done = 0
 
         def update_global_bars():
             done_photos_ratio = photos_global_done / max(total_images_global, 1)
             done_collages_ratio = (total_collages_sent_global) / max(total_collages_global, 1)
             overall_photos_progress.progress(done_photos_ratio, text=f"Photos traitées (global) : {photos_global_done} / {total_images_global}")
             overall_api_progress.progress(done_collages_ratio, text=f"Collages envoyés (global) : {total_collages_sent_global} / {total_collages_global}")
-
-        photos_global_done = 0
 
         # Pipeline : 3 images -> 1 collage
         for i in range(0, total_images, 3):
@@ -347,7 +388,7 @@ if st.button("Lancer le traitement"):
             group_jpegs = []
             for f in group:
                 try:
-                    raw = download_file_public(f["id"])
+                    raw = download_file_public(f["id"], f.get("resourceKey"))
                     jp = load_preprocess_jpeg(raw, max_dim=max_dim, quality=jpeg_quality)
                     group_jpegs.append(jp)
                 except Exception as e:
