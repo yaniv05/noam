@@ -181,7 +181,7 @@ def fidealis_send_batch(session_id: str, description: str, batch: List[Tuple[str
         data[f"file{idx}"] = base64.b64encode(jpeg_bytes).decode("utf-8")
 
     r = requests.post(API_URL, data=data, timeout=120)
-    r.raise_for_status()  # remonte si échec
+    r.raise_for_status()
     return r
 
 # =========================
@@ -189,7 +189,7 @@ def fidealis_send_batch(session_id: str, description: str, batch: List[Tuple[str
 # =========================
 class FidealisUploader:
     """
-    - queue maxsize=36 pour limiter la RAM (comme l'ancien "méga-batch").
+    - queue maxsize=36 pour limiter la RAM (≈ 36 photos = 12 collages).
     - Le worker dépile et envoie par sous-batches de 12.
     - On peut pousser les collages au fil de l'eau (par groupe de 3 images).
     """
@@ -210,13 +210,11 @@ class FidealisUploader:
             while not self._stop.is_set():
                 item = self.q.get()
                 if item is None:
-                    # flush restant
                     if buffer:
                         self._send_buffer(buffer)
                         buffer.clear()
                     break
                 buffer.append(item)
-                # dès qu'on a 12 -> envoi
                 if len(buffer) >= 12:
                     self._send_buffer(buffer)
                     buffer.clear()
@@ -224,20 +222,18 @@ class FidealisUploader:
             self._err = e
 
     def _send_buffer(self, buffer: List[Tuple[str, bytes]]):
-        # envoi du batch (<=12)
         fidealis_send_batch(self.session_id, self.description, buffer)
         self.sent += len(buffer)
         if self.on_progress:
             try:
                 self.on_progress(len(buffer))
             except Exception:
-                pass  # ne casse pas le worker si le callback échoue
+                pass
 
     def put(self, item: Tuple[str, bytes]):
-        self.q.put(item)  # bloque si >= 36 (limite RAM)
+        self.q.put(item)
 
     def close(self):
-        # signale fin, flush dans le worker
         self.q.put(None)
         self._thread.join()
         if self._err:
@@ -365,13 +361,25 @@ if st.button("Lancer le traitement"):
     # Compteurs globaux
     total_images_global = 0
     total_collages_global = 0
-    total_collages_sent_global = 0
+
+    # NEW: compteurs globaux mutables (pour éviter nonlocal/global)
+    photos_processed_global_box = {"value": 0}
+    total_collages_sent_global_box = {"value": 0}
     total_collages_sent_lock = threading.Lock()
 
     # Pour l’affichage temps réel
     overall_photos_progress = st.progress(0.0, text="Photos traitées (global)")
     overall_api_progress = st.progress(0.0, text="Collages envoyés à l'API (global)")
     overall_status = st.empty()
+
+    # Calcul total d'images pour le dénominateur global
+    for f in subfolders:
+        try:
+            imgs = list_images_public(f["id"], f.get("resourceKey"))
+            total_images_global += len(imgs)
+            total_collages_global += math.ceil(len(imgs) / 3) if imgs else 0
+        except Exception:
+            pass
 
     # Parcours de chaque sous-dossier
     for sf_idx, folder in enumerate(subfolders, start=1):
@@ -401,9 +409,7 @@ if st.button("Lancer le traitement"):
             st.write("Aucune image. On passe.")
             continue
 
-        total_images_global += total_images
         collages_expected = math.ceil(total_images / 3)
-        total_collages_global += collages_expected
 
         # UI par dossier
         photos_bar = st.progress(0.0, text=f"Photos traitées : 0 / {total_images}")
@@ -411,26 +417,37 @@ if st.button("Lancer le traitement"):
         status = st.empty()
 
         photos_done = 0
-        collages_done = 0
-        photos_global_done = 0
+
+        # NEW: compteur mutable pour ce dossier
+        collages_done_box = {"value": 0}
 
         # Callback de progression pour ce dossier (appelé par le worker)
         def on_folder_progress(increment: int):
-            nonlocal collages_done, total_collages_sent_global
-            collages_done += increment
             with total_collages_sent_lock:
-                total_collages_sent_global += increment
-            # (pas d'appel streamlit ici — mis à jour dans la boucle principale)
+                collages_done_box["value"] += increment
+                total_collages_sent_global_box["value"] += increment
 
         # Uploader parallèle pour ce dossier
         uploader = FidealisUploader(session_id, description, on_progress=on_folder_progress)
 
         def update_global_bars():
-            done_photos_ratio = photos_global_done / max(total_images_global, 1)
-            done_collages_ratio = (total_collages_sent_global) / max(total_collages_global, 1)
-            overall_photos_progress.progress(done_photos_ratio, text=f"Photos traitées (global) : {photos_global_done} / {total_images_global}")
-            overall_api_progress.progress(done_collages_ratio, text=f"Collages envoyés (global) : {total_collages_sent_global} / {total_collages_global}")
-            api_bar.progress(min(1.0, collages_done / max(collages_expected, 1)), text=f"Collages envoyés : {collages_done} / {collages_expected}")
+            # Global photos
+            done_photos_ratio = photos_processed_global_box["value"] / max(total_images_global or 1, 1)
+            overall_photos_progress.progress(
+                min(1.0, done_photos_ratio),
+                text=f"Photos traitées (global) : {photos_processed_global_box['value']} / {total_images_global}"
+            )
+            # Global collages
+            done_collages_ratio = total_collages_sent_global_box["value"] / max(total_collages_global or 1, 1)
+            overall_api_progress.progress(
+                min(1.0, done_collages_ratio),
+                text=f"Collages envoyés (global) : {total_collages_sent_global_box['value']} / {total_collages_global}"
+            )
+            # Dossier
+            api_bar.progress(
+                min(1.0, collages_done_box["value"] / max(collages_expected, 1)),
+                text=f"Collages envoyés : {collages_done_box['value']} / {collages_expected}"
+            )
 
         # Pipeline : 3 images -> 1 collage
         for i in range(0, total_images, 3):
@@ -449,7 +466,7 @@ if st.button("Lancer le traitement"):
             # Si on n'a rien (toutes sautées), on continue
             if not group_jpegs:
                 photos_done += len(group)
-                photos_global_done += len(group)
+                photos_processed_global_box["value"] += len(group)
                 photos_bar.progress(min(1.0, photos_done / total_images), text=f"Photos traitées : {photos_done} / {total_images}")
                 update_global_bars()
                 continue
@@ -465,7 +482,7 @@ if st.button("Lancer le traitement"):
 
             # Mise à jour des compteurs "photos"
             photos_done += len(group)
-            photos_global_done += len(group)
+            photos_processed_global_box["value"] += len(group)
             photos_bar.progress(min(1.0, photos_done / total_images), text=f"Photos traitées : {photos_done} / {total_images}")
 
             # Rafraîchit les barres globales et d'upload du dossier
@@ -478,9 +495,11 @@ if st.button("Lancer le traitement"):
             st.error(f"Erreur d’envoi Fidealis dans le worker : {e}")
 
         # Finalise les barres pour ce dossier
-        api_bar.progress(1.0, text=f"Collages envoyés : {collages_done} / {collages_expected}")
-        status.success(f"Dossier terminé — {collages_done} collages envoyés (à partir de {photos_done} photos).")
-        overall_status.info(f"Avancement global — {total_collages_sent_global} collages envoyés / {total_collages_global} attendus.")
+        api_bar.progress(1.0, text=f"Collages envoyés : {collages_done_box['value']} / {collages_expected}")
+        status.success(f"Dossier terminé — {collages_done_box['value']} collages envoyés (à partir de {photos_done} photos).")
+        overall_status.info(
+            f"Avancement global — {total_collages_sent_global_box['value']} collages envoyés / {total_collages_global} attendus."
+        )
         update_global_bars()
 
     st.success("Traitement terminé pour tous les dossiers détectés.")
