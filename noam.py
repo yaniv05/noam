@@ -393,7 +393,7 @@ if st.button("Lancer le traitement"):
 
         # Fin du sous-dossier
         api_bar.progress(1.0, text=f"Collages envoyés : {collages_done} / {collages_expected}")
-        status.success(f"✅ Dossier terminé — {collages_done} collages envoyés (à partir de {photos_done} photos).")
+        status.success(f"Dossier terminé — {collages_done} collages envoyés (à partir de {photos_done} photos).")
         overall_status.info(f"Avancement global — {total_collages_sent_global} collages envoyés / {total_collages_global} attendus.")
 
-    st.success("🎉 Traitement terminé pour tous les dossiers détectés.")
+    st.success("Traitement terminé pour tous les dossiers détectés.")
