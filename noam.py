@@ -18,48 +18,19 @@ ImageFile.LOAD_TRUNCATED_IMAGES = True
 API_URL = os.getenv("API_URL")                     # ex: https://api.fidealis.com/xxx
 API_KEY = os.getenv("API_KEY")
 ACCOUNT_KEY = os.getenv("ACCOUNT_KEY")
-GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")       # pour géocodage d'adresse (optionnel)
-# Service account : au CHOIX -> 1) JSON en clair via env, 2) chemin vers fichier .json
-#GDRIVE_SA_JSON = os.getenv("GOOGLE_DRIVE_SERVICE_ACCOUNT_JSON")  # contenu JSON (string)
-#GDRIVE_SA_JSON ='{"type": "service_account","project_id": "crm-api-460918","private_key_id": "34001b0d6862e0ebca00ca860722fa0afbeae511","private_key": "-----BEGIN PRIVATE KEY-----\nMIIEvwIBADANBgkqhkiG9w0BAQEFAASCBKkwggSlAgEAAoIBAQDCqWTT2aHIbQyX\njQtwxfXBHRzuIbO1mg93yNTEeHXQoC6pVhmIGE+n8s6QQrA60sm2SUUTI/km+iDd\nK6zhSIg6Cj/hfWdJWvJACogYTJROBxQAR2S91nl3ysPl0TVJQBnT0Rk/fcRet74V\nGvGyvLkjKbva+KY/PX91z/nq4H1cod8h0ChEVPDrJqRD+HLqJCERRQH8eb5+96fv\nYMC9Q25BXcyMmJ+bPa0R2vwF4Nde+dNZ3yqjX7wx+CSHbsdKg0OwVqLvEVcGmUMu\nl9W0pTigHtBaApqaWS34DtovtbYFmZDSpGgG2JszPF7G7bRAdtucVTSChJ3TgDOe\nYSIYpdwHAgMBAAECggEAM99f9vQvoHEuwdPcEJkv+93+L5bbhLEhHhJuYEyZWJbW\n2FkRRKr1zxNs6BRdUc+J4QF1XrxfUHum9kkFMKNbadwBWd1JAMszcs1bpt4BRymr\nssdTmSLmC34E5eDyCisCtucpiznAcl0UUhtz/OU9kJk2bguEgaWpqYNaXbSks2IY\nCAR2eUWm/PEC+193BTS8UUO0NlgKYAOz3FaBKChiaWFuQC/zJi4/ItHOm7LO7xnG\nozhNTBrhkwzedrHbk6aQobwysJuzAs7AhNn9g0QT9CfgdM/s3y3XEfSJj8jCouMw\nGpgqiOEDTW7VE5Y4Bq6jKlDAGQOIgBzWlU/qWtbcgQKBgQDvXpLlkA1Jj6OGqSpE\nnsoyfgPTP00/QbhkYxpIkjpCI1RYU1GMzhI5zc0J81c8APw8GA0NRgC2maQxV/Yb\ntKlnHRZmo6lyt8nYRYIt0yg5bepDKEPuld797S04dfJzDD+AZ70RochQ7hfzWwbZ\naKUszloQ3Ci2NaniHXKJw+enSQKBgQDQL6XjKZtDZ9NUTjE9Hn/Jqh82GNEEGupN\nv/Ti5zs1eRloeRlKEBw+mJeZc/fNS82pIEwRVq8msghn7xXlUZGPhkfLDwkVs0jc\nQfA2SV2yf4wVoK0sju7llETKWtuAQK8KeCa0jA/+iVysHnSUwtjtLZ2jzMUw21NY\n3DCfcbDYzwKBgQCcKsKB3PKeTIUuhM1byZE3Ufmi58i4/WKUtAdg024I2k3b9jfd\nOlCvv7IGzOjb7/SgLDzPrR0oBKMXwkCBoONor5R+0EXr3zZj0C13Qi0bErfkqq9v\nR/4dApEfJexQ3OvNFWFH0JoFGuErVvbn/prM2a/vEgPJpMc6C2Y/tT08aQKBgQC1\nNdRKL8wS1wvO5STc03Bdw/PY7a75yMfLl1t8KdOSzu77zfTiT7WWEtJaYuP+UY4Z\nOaCcsvxQTUUd2rEPY3m1GSfiqxq4Rc8U0VxalG+3UGhJ5wr1rxBoyy85h+5p62Ox\nVDY0j3nYkA4XT4cgeZ3CjSMbEcFOrooU3cyA7MAHZwKBgQCnNZYMcLHJBOw7Zqa2\nbUkJofLLmZUv4QJXJidSTtNUBlK/eNYKgvBdEB8escvSH4/OFdcqyaNEqXNxDyNm\nS4YMxHSkBnMAx4WkX2jt0zSV8mQDIllrXU3D5YMCxgTwp3lM0aPe9D8jfhofhtit\nhhUqEmj1kPxgJQ/BjGGxOWJtUg==\n-----END PRIVATE KEY-----\n","client_email": "fidealis@crm-api-460918.iam.gserviceaccount.com","client_id": "106921859688516733776","auth_uri": "https://accounts.google.com/o/oauth2/auth","token_uri": "https://oauth2.googleapis.com/token","auth_provider_x509_cert_url": "https://www.googleapis.com/oauth2/v1/certs","client_x509_cert_url": "https://www.googleapis.com/robot/v1/metadata/x509/fidealis%40crm-api-460918.iam.gserviceaccount.com","universe_domain": "googleapis.com"}'
-GDRIVE_SA_FILE = os.getenv("GOOGLE_DRIVE_SERVICE_ACCOUNT_FILE")  # chemin d'un fichier .json
-GDRIVE_SA_JSON = '''{
-  "type": "service_account",
-  "project_id": "crm-api-460918",
-  "private_key_id": "34001b0d6862e0ebca00ca860722fa0afbeae511",
-  "private_key": "-----BEGIN PRIVATE KEY-----\\nMIIEvwIBADANBgkqhkiG9w0BAQEFAASCBKkwggSlAgEAAoIBAQDCqWTT2aHIbQyX\\njQtwxfXBHRzuIbO1mg93yNTEeHXQoC6pVhmIGE+n8s6QQrA60sm2SUUTI/km+iDd\\nK6zhSIg6Cj/hfWdJWvJACogYTJROBxQAR2S91nl3ysPl0TVJQBnT0Rk/fcRet74V\\nGvGyvLkjKbva+KY/PX91z/nq4H1cod8h0ChEVPDrJqRD+HLqJCERRQH8eb5+96fv\\nYMC9Q25BXcyMmJ+bPa0R2vwF4Nde+dNZ3yqjX7wx+CSHbsdKg0OwVqLvEVcGmUMu\\nl9W0pTigHtBaApqaWS34DtovtbYFmZDSpGgG2JszPF7G7bRAdtucVTSChJ3TgDOe\\nYSIYpdwHAgMBAAECggEAM99f9vQvoHEuwdPcEJkv+93+L5bbhLEhHhJuYEyZWJbW\\n2FkRRKr1zxNs6BRdUc+J4QF1XrxfUHum9kkFMKNbadwBWd1JAMszcs1bpt4BRymr\\nssdTmSLmC34E5eDyCisCtucpiznAcl0UUhtz/OU9kJk2bguEgaWpqYNaXbSks2IY\\nCAR2eUWm/PEC+193BTS8UUO0NlgKYAOz3FaBKChiaWFuQC/zJi4/ItHOm7LO7xnG\\nozhNTBrhkwzedrHbk6aQobwysJuzAs7AhNn9g0QT9CfgdM/s3y3XEfSJj8jCouMw\\nGpgqiOEDTW7VE5Y4Bq6jKlDAGQOIgBzWlU/qWtbcgQKBgQDvXpLlkA1Jj6OGqSpE\\nnsoyfgPTP00/QbhkYxpIkjpCI1RYU1GMzhI5zc0J81c8APw8GA0NRgC2maQxV/Yb\\ntKlnHRZmo6lyt8nYRYIt0yg5bepDKEPuld797S04dfJzDD+AZ70RochQ7hfzWwbZ\\naKUszloQ3Ci2NaniHXKJw+enSQKBgQDQL6XjKZtDZ9NUTjE9Hn/Jqh82GNEEGupN\\nv/Ti5zs1eRloeRlKEBw+mJeZc/fNS82pIEwRVq8msghn7xXlUZGPhkfLDwkVs0jc\\nQfA2SV2yf4wVoK0sju7llETKWtuAQK8KeCa0jA/+iVysHnSUwtjtLZ2jzMUw21NY\\n3DCfcbDYzwKBgQCcKsKB3PKeTIUuhM1byZE3Ufmi58i4/WKUtAdg024I2k3b9jfd\\nOlCvv7IGzOjb7/SgLDzPrR0oBKMXwkCBoONor5R+0EXr3zZj0C13Qi0bErfkqq9v\\nR/4dApEfJexQ3OvNFWFH0JoFGuErVvbn/prM2a/vEgPJpMc6C2Y/tT08aQKBgQC1\\nNdRKL8wS1wvO5STc03Bdw/PY7a75yMfLl1t8KdOSzu77zfTiT7WWEtJaYuP+UY4Z\\nOaCcsvxQTUUd2rEPY3m1GSfiqxq4Rc8U0VxalG+3UGhJ5wr1rxBoyy85h+5p62Ox\\nVDY0j3nYkA4XT4cgeZ3CjSMbEcFOrooU3cyA7MAHZwKBgQCnNZYMcLHJBOw7Zqa2\\nbUkJofLLmZUv4QJXJidSTtNUBlK/eNYKgvBdEB8escvSH4/OFdcqyaNEqXNxDyNm\\nS4YMxHSkBnMAx4WkX2jt0zSV8mQDIllrXU3D5YMCxgTwp3lM0aPe9D8jfhofhtit\\nhhUqEmj1kPxgJQ/BjGGxOWJtUg==\\n-----END PRIVATE KEY-----\\n",
-  "client_email": "fidealis@crm-api-460918.iam.gserviceaccount.com",
-  "client_id": "106921859688516733776",
-  "auth_uri": "https://accounts.google.com/o/oauth2/auth",
-  "token_uri": "https://oauth2.googleapis.com/token",
-  "auth_provider_x509_cert_url": "https://www.googleapis.com/oauth2/v1/certs",
-  "client_x509_cert_url": "https://www.googleapis.com/robot/v1/metadata/x509/fidealis%40crm-api-460918.iam.gserviceaccount.com",
-  "universe_domain": "googleapis.com"
-}'''
 
+# Géocodage Google Maps (optionnel, inchangé)
+GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
+
+# *** Clé Google Drive pour accès public ***
+GOOGLE_DRIVE_API_KEY = os.getenv("GOOGLE_DRIVE_API_KEY")   # <-- NOUVELLE VAR D'ENV OBLIGATOIRE (public-only)
 
 MAX_DIM = int(os.getenv("MAX_DIM", "1600"))        # redimensionnement max (px)
 JPEG_QUALITY = int(os.getenv("JPEG_QUALITY", "80"))
 
 # =========================
-# Google APIs (Drive)
+# Google Drive (PUBLIC-ONLY via API key)
 # =========================
-from google.oauth2 import service_account
-from googleapiclient.discovery import build
-from googleapiclient.http import MediaIoBaseDownload
-
-def get_drive_service():
-    scopes = ['https://www.googleapis.com/auth/drive.readonly']
-    if GDRIVE_SA_JSON:
-        info = json.loads(GDRIVE_SA_JSON)
-        creds = service_account.Credentials.from_service_account_info(info, scopes=scopes)
-    elif GDRIVE_SA_FILE:
-        creds = service_account.Credentials.from_service_account_file(GDRIVE_SA_FILE, scopes=scopes)
-    else:
-        raise RuntimeError("Aucune crédential Google Drive fournie. Définis GOOGLE_DRIVE_SERVICE_ACCOUNT_JSON ou GOOGLE_DRIVE_SERVICE_ACCOUNT_FILE.")
-    # cache_discovery=False évite un warning
-    return build('drive', 'v3', credentials=creds, cache_discovery=False)
-
 def extract_folder_id(maybe_url: str) -> str:
     m = re.search(r'/folders/([a-zA-Z0-9_-]+)', maybe_url)
     if m:
@@ -68,54 +39,67 @@ def extract_folder_id(maybe_url: str) -> str:
         return maybe_url
     raise ValueError("Impossible de détecter l'ID du dossier : fournis une URL Drive ou un ID.")
 
-def list_subfolders(drive, parent_id: str) -> List[dict]:
-    """Liste les sous-dossiers directs du parent."""
-    q = f"'{parent_id}' in parents and trashed=false and mimeType='application/vnd.google-apps.folder'"
-    subfolders = []
-    page_token = None
-    while True:
-        resp = drive.files().list(
-            q=q,
-            spaces='drive',
-            fields="nextPageToken, files(id,name,parents)",
-            pageToken=page_token
-        ).execute()
-        subfolders.extend(resp.get('files', []))
-        page_token = resp.get('nextPageToken')
-        if not page_token:
-            break
-    return subfolders
+def _drive_list_children_public(parent_id: str, q_extra: Optional[str] = None) -> List[dict]:
+    """
+    Liste les éléments d'un dossier PUBLIC (Anyone with the link) via API Key.
+    q_extra: filtre additionnel, ex. "and mimeType='application/vnd.google-apps.folder'"
+    """
+    if not GOOGLE_DRIVE_API_KEY:
+        raise RuntimeError("GOOGLE_DRIVE_API_KEY manquant dans l'environnement.")
 
-def list_images_in_folder(drive, folder_id: str) -> List[dict]:
-    """Liste les fichiers image (mimeType image/*) d'un dossier (pas récursif)."""
-    q = f"'{folder_id}' in parents and trashed=false and mimeType contains 'image/'"
-    images = []
-    page_token = None
-    while True:
-        resp = drive.files().list(
-            q=q,
-            spaces='drive',
-            fields="nextPageToken, files(id,name,mimeType,size,createdTime)",
-            pageToken=page_token
-        ).execute()
-        images.extend(resp.get('files', []))
-        page_token = resp.get('nextPageToken')
-        if not page_token:
-            break
-    # Petit tri par nom pour stabilité
-    images.sort(key=lambda f: f.get('name',''))
-    return images
+    base_url = "https://www.googleapis.com/drive/v3/files"
+    q = f"'{parent_id}' in parents and trashed=false"
+    if q_extra:
+        q += f" {q_extra}"
 
-def download_image_bytes(drive, file_id: str) -> bytes:
-    """Télécharge un fichier Drive en mémoire (BytesIO) par streaming."""
-    request = drive.files().get_media(fileId=file_id)
-    fh = io.BytesIO()
-    downloader = MediaIoBaseDownload(fh, request)
-    done = False
-    while not done:
-        status, done = downloader.next_chunk()
-        # on pourrait afficher une barre de progression par fichier si besoin
-    return fh.getvalue()
+    params = {
+        "q": q,
+        "fields": "nextPageToken, files(id,name,mimeType,size,createdTime,parents)",
+        "key": GOOGLE_DRIVE_API_KEY,
+        "pageSize": 1000,
+        "supportsAllDrives": "false",
+        "includeItemsFromAllDrives": "false",
+    }
+
+    files = []
+    while True:
+        r = requests.get(base_url, params=params, timeout=30)
+        r.raise_for_status()
+        data = r.json()
+        files.extend(data.get("files", []))
+        token = data.get("nextPageToken")
+        if not token:
+            break
+        params["pageToken"] = token
+    return files
+
+def list_subfolders_public(parent_id: str) -> List[dict]:
+    return _drive_list_children_public(
+        parent_id,
+        q_extra="and mimeType='application/vnd.google-apps.folder'"
+    )
+
+def list_images_public(parent_id: str) -> List[dict]:
+    files = _drive_list_children_public(
+        parent_id,
+        q_extra="and mimeType contains 'image/'"
+    )
+    # Tri par nom pour stabilité
+    files.sort(key=lambda f: f.get('name', ''))
+    return files
+
+def download_file_public(file_id: str) -> bytes:
+    """
+    Télécharge le contenu d'un fichier PUBLIC (ou 'Anyone with link').
+    """
+    if not GOOGLE_DRIVE_API_KEY:
+        raise RuntimeError("GOOGLE_DRIVE_API_KEY manquant dans l'environnement.")
+
+    url = f"https://www.googleapis.com/drive/v3/files/{file_id}"
+    params = {"alt": "media", "key": GOOGLE_DRIVE_API_KEY}
+    r = requests.get(url, params=params, timeout=120)
+    r.raise_for_status()
+    return r.content
 
 # =========================
 # Google Maps Geocoding (optionnel)
@@ -198,7 +182,6 @@ def create_collage_from_three(jpegs: List[bytes]) -> bytes:
     Hauteur = min des hauteurs, marge interne légère.
     """
     images = [Image.open(io.BytesIO(b)) for b in jpegs]
-    # Harmoniser la hauteur (min)
     min_h = min(im.height for im in images)
     resized = []
     for im in images:
@@ -206,7 +189,6 @@ def create_collage_from_three(jpegs: List[bytes]) -> bytes:
         new_w = int(im.width * scale)
         resized.append(im.resize((new_w, min_h), Image.LANCZOS))
 
-    # Canvas blanc avec padding 25px et 20px entre images
     total_w = sum(im.width for im in resized) + (len(resized)-1)*20 + 50
     canvas = Image.new("RGB", (total_w, min_h + 50), (255, 255, 255))
     x = 25
@@ -233,7 +215,6 @@ def upload_collages_to_fidealis(session_id: str, description: str, collages: Lis
     sent = 0
     for i in range(0, len(collages), 36):
         mega = collages[i:i+36]
-        # sous-batches de 12 pour setDeposit
         for j in range(0, len(mega), 12):
             batch = mega[j:j+12]
             data = {
@@ -249,9 +230,7 @@ def upload_collages_to_fidealis(session_id: str, description: str, collages: Lis
             for idx, (fname, jpeg_bytes) in enumerate(batch, start=1):
                 data[f"filename{idx}"] = fname
                 data[f"file{idx}"] = encode_base64_bytes(jpeg_bytes)
-            # POST
             r = requests.post(API_URL, data=data, timeout=120)
-            # Option: vérifier r.status_code / r.json()
             sent += len(batch)
             if progress_cb:
                 progress_cb(sent, len(collages))
@@ -260,7 +239,12 @@ def upload_collages_to_fidealis(session_id: str, description: str, collages: Lis
 # =========================
 # Streamlit UI
 # =========================
-st.title("FIDEALIS — Drive → Collages → Upload (Batch 36 / 12)")
+st.title("FIDEALIS — Drive (Public) → Collages → Upload (Batch 36 / 12)")
+
+# Vérif API key Drive
+if not GOOGLE_DRIVE_API_KEY:
+    st.error("GOOGLE_DRIVE_API_KEY manquant. Ajoute la clé d'API Google Drive dans l'environnement.")
+    st.stop()
 
 # Connexion Fidealis
 session_id = api_login()
@@ -272,7 +256,7 @@ credit_data = get_credit(session_id)
 if isinstance(credit_data, dict):
     st.write(f"Crédit restant (Produit 4) : {get_quantity_for_product_4(credit_data)}")
 
-root_input = st.text_input("URL ou ID du dossier Drive racine (contenant les sous-dossiers `Client - Adresse`)")
+root_input = st.text_input("URL ou ID du dossier Drive PUBLIC (contenant les sous-dossiers `Client - Adresse`)")
 
 max_dim = st.slider("Dimension max (px)", 800, 4000, MAX_DIM, step=100)
 jpeg_quality = st.slider("Qualité JPEG", 50, 95, JPEG_QUALITY, step=1)
@@ -284,17 +268,15 @@ if st.button("Lancer le traitement"):
         st.error(f"ID/URL de dossier invalide : {e}")
         st.stop()
 
-    # Instancier Drive
+    # Lister sous-dossiers "Client - Adresse" (public only)
     try:
-        drive = get_drive_service()
+        subfolders = list_subfolders_public(root_id)
     except Exception as e:
-        st.error(f"Impossible d'initialiser l'API Google Drive : {e}")
+        st.error(f"Erreur liste sous-dossiers (public): {e}")
         st.stop()
 
-    # Lister sous-dossiers "Client - Adresse"
-    subfolders = list_subfolders(drive, root_id)
     if not subfolders:
-        st.warning("Aucun sous-dossier trouvé sous ce dossier racine.")
+        st.warning("Aucun sous-dossier trouvé sous ce dossier PUBLIC. Vérifie le partage 'Anyone with the link'.")
         st.stop()
 
     st.info(f"{len(subfolders)} sous-dossiers détectés.")
@@ -324,14 +306,19 @@ if st.button("Lancer le traitement"):
         description = build_description(client_name, address, lat, lng)
 
         st.subheader(f"Dossier {sf_idx}/{len(subfolders)} — {folder_name}")
-        images = list_images_in_folder(drive, folder_id)
+
+        try:
+            images = list_images_public(folder_id)
+        except Exception as e:
+            st.warning(f"Impossible de lister les images (public) pour {folder_name} : {e}")
+            continue
+
         total_images = len(images)
         if total_images == 0:
             st.write("Aucune image. On passe.")
             continue
 
         total_images_global += total_images
-        # Nombre de collages = ceil(n/3)
         collages_expected = math.ceil(total_images / 3)
         total_collages_global += collages_expected
 
@@ -340,23 +327,19 @@ if st.button("Lancer le traitement"):
         api_bar = st.progress(0.0, text=f"Collages envoyés : 0 / {collages_expected}")
         status = st.empty()
 
-        # Pipeline : on travaille par groupe de 3 images -> produit 1 collage
         collages_buffer: List[Tuple[str, bytes]] = []
         photos_done = 0
         collages_done = 0
 
         def update_global_bars():
-            # met à jour barres globales
             done_photos_ratio = photos_global_done / max(total_images_global, 1)
             done_collages_ratio = (total_collages_sent_global) / max(total_collages_global, 1)
             overall_photos_progress.progress(done_photos_ratio, text=f"Photos traitées (global) : {photos_global_done} / {total_images_global}")
             overall_api_progress.progress(done_collages_ratio, text=f"Collages envoyés (global) : {total_collages_sent_global} / {total_collages_global}")
 
-        # On calcule au fur et à mesure
-        photos_global_done = 0  # pour ce dossier, on l’ajoutera au global au fil de l’eau
+        photos_global_done = 0
 
-        # Télécharger → préprocess → composer collages → upload par 36 → soumettre par 12
-        # On évite d'accumuler trop en RAM : on fait un cycle "3 img -> 1 collage" puis on flush par paquets de 36
+        # Pipeline : 3 images -> 1 collage
         for i in range(0, total_images, 3):
             group = images[i:i+3]
 
@@ -364,15 +347,14 @@ if st.button("Lancer le traitement"):
             group_jpegs = []
             for f in group:
                 try:
-                    raw = download_image_bytes(drive, f["id"])
+                    raw = download_file_public(f["id"])
                     jp = load_preprocess_jpeg(raw, max_dim=max_dim, quality=jpeg_quality)
                     group_jpegs.append(jp)
                 except Exception as e:
                     st.warning(f"Image sautée ({f.get('name','?')}): {e}")
 
-            # Si rien dans le groupe, continue
             if not group_jpegs:
-                photos_done += len(group)  # on considère traitées (skippées)
+                photos_done += len(group)
                 photos_global_done += len(group)
                 photos_bar.progress(min(1.0, photos_done / total_images), text=f"Photos traitées : {photos_done} / {total_images}")
                 update_global_bars()
@@ -393,12 +375,10 @@ if st.button("Lancer le traitement"):
             photos_global_done += len(group)
             photos_bar.progress(min(1.0, photos_done / total_images), text=f"Photos traitées : {photos_done} / {total_images}")
 
-            # Dès qu’on a 36 collages en tampon, on envoie ce “méga-batch”
+            # Flush par méga-batch de 36 collages (ou fin)
             if len(collages_buffer) >= 36 or (i + 3) >= total_images:
-                # Progress callback pour ce dossier
                 sent_before = collages_done - len(collages_buffer)
                 def cb(sent_now, total_in_this_flush):
-                    # sent_now est cumulatif dans ce flush. On mappe sur la progression du dossier.
                     sent_total = sent_before + sent_now
                     api_bar.progress(min(1.0, sent_total / collages_expected), text=f"Collages envoyés : {min(sent_total, collages_expected)} / {collages_expected}")
 
@@ -407,10 +387,8 @@ if st.button("Lancer le traitement"):
                     total_collages_sent_global += len(collages_buffer)
                 except Exception as e:
                     st.error(f"Erreur d’envoi Fidealis (méga-batch) : {e}")
-                    # on vide quand même pour continuer avec le reste
                 finally:
                     collages_buffer.clear()
-                    # Mise à jour globale
                     update_global_bars()
 
         # Fin du sous-dossier
